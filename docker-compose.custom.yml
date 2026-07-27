@@ -1,0 +1,58 @@
+# DB-GPT custom compose for CentOS deployment.
+# Brings up the DB-GPT webserver with a sqlite-backed metadata DB (no MySQL).
+#
+# Usage (on CentOS server):
+#   1. Place your openai.toml in ./configs/openai.toml
+#   2. docker compose -f docker-compose.custom.yml up -d
+#   3. docker compose -f docker-compose.custom.yml logs -f webserver
+#
+# Build locally first:
+#   docker compose -f docker-compose.custom.yml build
+
+services:
+  webserver:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.custom
+    image: dbgpt-custom:latest
+    container_name: dbgpt-webserver
+    restart: unless-stopped
+    ports:
+      - "5670:5670/tcp"
+    volumes:
+      # Mount config so you can edit openai.toml without rebuilding
+      - ./configs:/app/configs
+      # Mount source code so Python edits take effect without rebuilding
+      # (the image already has the venv at /opt/.uv.venv; this overlays
+      # /app/packages and /app/configs onto the running container).
+      - ./packages:/app/packages
+      - ./dbgpt-server.py:/app/dbgpt-server.py
+      # Persist vector store + metadata + messages
+      - dbgpt-data:/app/pilot/data
+      - dbgpt-meta:/app/pilot/meta_data
+      - dbgpt-message:/app/pilot/message
+      # Mount your sqlite example dbs (Walmart_Sales, st_embed, etc.)
+      - ./pilot/examples:/app/pilot/examples
+    environment:
+      - DBGPT_LANG=zh
+    networks:
+      - dbgptnet
+    # Use host IPC to avoid potential shared memory issues
+    ipc: host
+    # Healthcheck: hit the db list API
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:5670/api/v1/chat/db/list || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+networks:
+  dbgptnet:
+    driver: bridge
+    name: dbgptnet
+
+volumes:
+  dbgpt-data:
+  dbgpt-meta:
+  dbgpt-message:

@@ -1,0 +1,143 @@
+# DB-GPT custom image for CentOS deployment.
+# CPU-only, no CUDA, no local model — uses remote OpenAI-compatible API.
+# Inherits the multi-stage build pattern from docker/base/Dockerfile but
+# trims the image by removing CUDA / Rust / hf extras that we don't need.
+#
+# Build (run from project root):
+#   docker build -f docker/Dockerfile.custom -t dbgpt-custom:latest .
+#
+# Run:
+#   docker run -d --name dbgpt -p 5670:5670 \
+#     -v $(pwd)/configs:/app/configs \
+#     -v dbgpt-data:/app/pilot/data \
+#     --restart unless-stopped \
+#     dbgpt-custom:latest
+
+ARG BASE_IMAGE="ubuntu:22.04"
+ARG PYTHON_VERSION=3.11
+
+############################
+# Stage 1: builder
+############################
+FROM ${BASE_IMAGE} AS builder
+ARG BASE_IMAGE
+ARG PYTHON_VERSION
+ARG PIP_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple"
+ARG UV_HTTP_TIMEOUT=600
+ARG EXTRAS="base,proxy_openai,rag,storage_chromadb,dbgpts"
+
+ENV PYTHONUNBUFFERED=1 \
+    DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PIP_INDEX_URL=${PIP_INDEX_URL} \
+    UV_INDEX_URL=${PIP_INDEX_URL} \
+    UV_DEFAULT_INDEX=${PIP_INDEX_URL} \
+    UV_HTTP_TIMEOUT=${UV_HTTP_TIMEOUT}
+
+# Use Aliyun mirror for apt (much faster in China than archive.ubuntu.com).
+# Two-phase: first install ca-certificates + apt-transport-https from the
+# default HTTP source (so HTTPS works), then switch to Aliyun HTTPS mirror.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates apt-transport-https gnupg \
+    && sed -i 's|http://archive.ubuntu.com|https://mirrors.aliyun.com|g' /etc/apt/sources.list \
+    && sed -i 's|http://security.ubuntu.com|https://mirrors.aliyun.com|g' /etc/apt/sources.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        python${PYTHON_VERSION} \
+        python${PYTHON_VERSION}-dev \
+        python${PYTHON_VERSION}-venv \
+        python3-pip \
+        git curl wget \
+        tzdata sqlite3 \
+        libpq-dev default-libmysqlclient-dev \
+        build-essential pkg-config \
+    && rm -rf /var/lib/apt/lists/* \
+    && python${PYTHON_VERSION} -m pip install --upgrade pip -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    && python${PYTHON_VERSION} -m pip install uv -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    && uv --version
+
+ENV PATH="${PATH}"
+
+WORKDIR /app
+ENV VIRTUAL_ENV=/app/.venv
+RUN python${PYTHON_VERSION} -m venv $VIRTUAL_ENV
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+# Copy only manifests first for better layer caching
+COPY pyproject.toml README.md uv.lock ./
+COPY packages /app/packages
+
+# Install Python deps using `uv pip install` (NOT `uv sync`).
+# Reason: uv.lock pins each package's URL to https://files.pythonhosted.org/
+# (PyPI CDN, slow from China). `uv sync --frozen` respects those pinned URLs
+# and ignores --index-url, so downloads time out (8MB matplotlib takes 10+
+# minutes). `uv pip install` does NOT read uv.lock and respects --index-url,
+# so it uses the Chinese mirror (2-3 MB/s) instead of pythonhosted.org.
+# This keeps `uv` as the installer (same as before) but bypasses uv.lock.
+#
+# Pin chromadb to 0.6.3 (the version in uv.lock) because chromadb 1.x has
+# breaking API changes (CollectionConfigurationInternal no longer has .get())
+# that our chroma_store.py doesn't handle.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --upgrade pip -i ${PIP_INDEX_URL} && \
+    uv pip install "chromadb==0.6.3" -i ${PIP_INDEX_URL} && \
+    uv pip install "pyhive" "kazoo" "thriftpy2" "thrift" "pure-sasl" -i ${PIP_INDEX_URL} && \
+    uv pip install -e "./packages/dbgpt-core" \
+        -e "./packages/dbgpt-serve" \
+        -e "./packages/dbgpt-client" \
+        -e "./packages/dbgpt-sandbox" \
+        -i ${PIP_INDEX_URL} && \
+    uv pip install -e "./packages/dbgpt-ext[${EXTRAS}]" \
+        -i ${PIP_INDEX_URL} && \
+    uv pip install -e "./packages/dbgpt-app" \
+        -i ${PIP_INDEX_URL} && \
+    python -c "import dbgpt; print('dbgpt version:', dbgpt.__version__)"
+
+############################
+# Stage 2: runtime
+############################
+FROM ${BASE_IMAGE}
+ARG PYTHON_VERSION
+
+ENV PYTHONUNBUFFERED=1 \
+    DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
+
+# Use Aliyun mirror for apt (much faster in China).
+# Two-phase: first install ca-certificates via HTTP, then switch to HTTPS.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates apt-transport-https \
+    && sed -i 's|http://archive.ubuntu.com|https://mirrors.aliyun.com|g' /etc/apt/sources.list \
+    && sed -i 's|http://security.ubuntu.com|https://mirrors.aliyun.com|g' /etc/apt/sources.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        git sqlite3 \
+        python${PYTHON_VERSION} \
+        python${PYTHON_VERSION}-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy the built virtualenv from builder stage
+ENV FINAL_VENV_NAME="/opt/.uv.venv"
+COPY --from=builder /app/.venv ${FINAL_VENV_NAME}
+
+# Copy application source (includes our custom memory_store.py etc.)
+COPY . .
+
+# Fix shebangs / activate paths so the venv works at the new location
+RUN sed -i "s|^#\!/app/\.venv/bin/python[0-9.]*|#!/${FINAL_VENV_NAME}/bin/python${PYTHON_VERSION}|" \
+        /${FINAL_VENV_NAME}/bin/dbgpt \
+        /${FINAL_VENV_NAME}/bin/pip 2>/dev/null || true && \
+    sed -i "s|/app/\.venv|${FINAL_VENV_NAME}|g" \
+        /${FINAL_VENV_NAME}/bin/activate
+
+ENV PATH="${FINAL_VENV_NAME}/bin:$PATH" \
+    VIRTUAL_ENV="${FINAL_VENV_NAME}"
+
+# Create default data directory
+RUN mkdir -p /app/pilot/data /app/pilot/meta_data
+
+EXPOSE 5670
+
+# Default config is the user's openai.toml; override with -c if needed
+CMD ["dbgpt", "start", "webserver", "--config", "configs/openai.toml"]
