@@ -284,8 +284,8 @@ class AgentMemory(Memory[AgentMemoryFragment]):
     """Agent memory.
 
     组合了两套 memory 体系：
-    - self.memory: 短期/长期/混合记忆（仿人脑分层），默认 ShortTermMemory(buffer_size=5)
-      保留最近 5 个 ReAct step（每个 step = Question/Thought/Action/Observation）
+    - self.memory: 短期/长期/混合记忆（仿人脑分层），默认 ShortTermMemory(buffer_size=10)
+      保留最近 10 个 ReAct step（每个 step = Question/Thought/Action/Observation）
     - self.gpts_memory: GPTs 会话记忆（多 agent 协作的消息总线 + 计划本）
       默认 GptsMemory()，message_memory 用 MetaDbGptsMessageMemory 落 gpts_messages 表
     两者的关系：
@@ -312,8 +312,10 @@ class AgentMemory(Memory[AgentMemoryFragment]):
             gpts_memory(GptsMemory): Memory to store GPTs related information
         """
         if not memory:
-            # 默认短期记忆：进程内存，buffer_size=5（保留最近 5 个 ReAct step）
-            memory = ShortTermMemory(buffer_size=5)
+            # 默认短期记忆：进程内存，buffer_size=10（保留最近 10 个 ReAct step）
+            # 从 5 调到 10：让 memory_list 携带更多最近 step 的完整细节；
+            # 全步长概览由 task_progress_summary（见 role.py）覆盖，避免无限制放大。
+            memory = ShortTermMemory(buffer_size=10)
         if not gpts_memory:
             gpts_memory = GptsMemory()
         self.memory: Memory[AgentMemoryFragment] = cast(

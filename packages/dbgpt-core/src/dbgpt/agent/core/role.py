@@ -215,7 +215,8 @@ class Role(ABC, BaseModel):
         model never forgets what has already been done and what still needs to be
         done to complete the original task.
         """
-        progress = getattr(self, "_task_progress", [])
+        # 只读实例级 _task_progress，避免读到类属性共享的空列表（跨实例污染）
+        progress = self.__dict__.get("_task_progress") or []
         if not progress:
             return None
         lines = ["## Task Progress (do NOT repeat completed steps)"]
@@ -342,7 +343,10 @@ class Role(ABC, BaseModel):
         # ------------------------------------------------------------------
         snapshot_path: Optional[str] = None
         if check_pass and action:
-            if not hasattr(self, "_task_progress") or self._task_progress is None:
+            # _task_progress 声明为类属性（role.py 顶部），直接 hasattr 判断永远为 True，
+            # 会误用共享的类级列表导致跨实例/跨会话累积。必须检查实例 __dict__ ，
+            # 首次写入时创建实例级列表以遮蔽类属性。
+            if "_task_progress" not in self.__dict__ or self._task_progress is None:
                 object.__setattr__(self, "_task_progress", [])
             progress: List[Dict] = self._task_progress  # type: ignore[assignment]
             step_num = (current_retry_counter or 0) + 1

@@ -24,7 +24,7 @@ persist_path = "pilot/data"
 # Model Configurations
 [models]
 [[models.llms]]
-name = "Web_model"
+name = "Deepseek-V4-Flash"
 provider = "proxy/openai"
 api_base = "https://aicode.longsys.com/v1"
 api_key = "d57f6e3761e270cca9c58baeb32b86d04beeead1ee31f430f8dcd8684a590722b946cc95d23a597c5d2b03946baab892"

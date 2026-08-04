@@ -1882,7 +1882,7 @@ class ConversableAgent(Role, Agent):
         # 最终发给 LLM 的消息列表顺序：
         #   1. system_prompt          （含 database_context / knowledge_context 等）
         #   2. historical_dialogues   （来自 agentic_data_api.py 全量加载的会话历史）
-        #   3. memory_list            （来自 ShortTermMemory.read，最近 5 个 ReAct step）
+        #   3. memory_list            （来自 ShortTermMemory.read，最近 10 个 ReAct step）
         #   4. user_prompt            （当前轮 Observation，含向量库检索的表结构）
         # ⚠️ historical_dialogues 和 memory_list 内容重叠：
         #    两者都来自 gpts_messages 表，只是读取路径不同
@@ -1985,21 +1985,20 @@ class ConversableAgent(Role, Agent):
         # ⚠️ 与下面的 memory_list 内容重叠（都来自 gpts_messages 表）
         # ─────────────────────────────────────────────────────────────
         if historical_dialogues:
-            for i in range(len(historical_dialogues)):
-                if i % 2 == 0:
-                    # 偶数位是用户消息
-                    message = historical_dialogues[i]
-                    message.role = ModelMessageRoleType.HUMAN  # 设置为 HUMAN
-                    agent_messages.append(message)
-                else:
-                    # 奇数位是 AI 回复
-                    message = historical_dialogues[i]
-                    message.role = ModelMessageRoleType.AI  # 设置为 AI
-                    agent_messages.append(message)
+            for i, message in enumerate(historical_dialogues):
+                # 尊重已设置的 role（如 API 层从 view 提取的 AI 回复）；仅在未设置时
+                # 按奇偶位置兜底，避免 view 缺 final_content 时历史不交替导致误标。
+                if message.role is None:
+                    message.role = (
+                        ModelMessageRoleType.HUMAN
+                        if i % 2 == 0
+                        else ModelMessageRoleType.AI
+                    )
+                agent_messages.append(message)
 
         # ─────────────────────────────────────────────────────────────
         # 【消息 #3：memory_list】
-        # 来自 ShortTermMemory.read，最近 5 个 ReAct step（Question/Thought/Action/Observation）
+        # 来自 ShortTermMemory.read，最近 10 个 ReAct step（Question/Thought/Action/Observation）
         # 这些 fragment 是 build() 时从 gpts_messages 表恢复的
         # ⚠️ 与上面的 historical_dialogues 内容重叠
         # ─────────────────────────────────────────────────────────────

@@ -1,4 +1,4 @@
-"""agentic_data_api.py —— DB-GPT v0.8.1 ReAct Agent 核心 API 入口。
+"""_data_api.py —— DB-GPT v0.8.1 ReAct Agent 核心 API 入口。
 
 本文件是 DB-GPT 智能体数据 API 的总入口，注册了以下 FastAPI 路由：
 
@@ -42,6 +42,7 @@ import os  # 操作系统路径
 import re  # 正则
 import shutil  # 高级文件操作（拷贝、删除目录树）
 import tempfile  # 临时目录
+import time  # 时间戳（缓存 TTL）
 import uuid  # 唯一 ID
 import zipfile  # zip 压缩/解压
 from pathlib import Path, PurePosixPath, PureWindowsPath  # 跨平台路径处理
@@ -81,6 +82,40 @@ if TYPE_CHECKING:  # 仅类型检查时导入，避免运行时循环依赖
 
 # 进程级缓存：conv_id -> GptsMemory，跨 HTTP 请求复用 Agent 记忆
 REACT_AGENT_MEMORY_CACHE: Dict[str, "GptsMemory"] = {}
+
+# 会话级 DB schema 紧凑表清单缓存：conv_id -> (获取时间戳, 紧凑表清单字符串)
+# 首次涉库问题从 OpenMetadata/Kyuubi 拉一次，会话内后续请求复用注入 system prompt
+_TABLE_CATALOG_CACHE: Dict[str, Tuple[float, str]] = {}
+
+# 缓存 TTL（秒）：OpenMetadata 元数据（表描述/术语）更新后，最长 TTL 内重新拉取。
+# 可通过 TOML 的 openmetadata_cache_ttl_seconds 覆盖。
+_OM_CACHE_TTL = 1800  # 30 分钟
+
+
+def _is_cache_fresh(cached: Optional[Tuple[float, str]], ttl: float) -> bool:
+    """判断缓存条目是否在 TTL 内（未过期）。"""
+    if not cached:
+        return False
+    return (time.time() - cached[0]) < ttl
+
+# 业务术语与口径段缓存（进程级，按术语库名 key；TTL 内复用，过期重新拉取以同步 OpenMetadata 更新）
+_GLOSSARY_NAME = "商规EMBED生产测试术语库"
+_GLOSSARY_WHITELIST = [
+    "数仓分层",
+    "字段命名规范",
+    "Entity",
+    "Subject",
+    "Grain",
+    "Period",
+    "test_result",
+    "汇总指标",
+    "指标（Indicator）",
+    "ETL平台字段",
+    "测项命名规范",
+    "GUID生成规则",
+    "测试JSON结构",
+]
+_GLOSSARY_CACHE: Dict[str, Tuple[float, str]] = {}
 
 # 默认技能目录（来自全局配置）
 DEFAULT_SKILLS_DIR = SKILLS_DIR
@@ -249,6 +284,224 @@ async def _load_context_budget_config(
             "Failed to load agent context config; using defaults", exc_info=True
         )
         return defaults
+
+
+def _load_openmetadata_config() -> "OpenMetadataConfig":
+    """解析 OpenMetadata 连接与工具配置。
+
+    优先级：
+      1. TOML 显式配置 `[service.web.agent_context]` 下 `openmetadata_*` 字段
+         （enabled=true 且 server_uri 非空时生效）
+      2. 自动从前端配置的 openmetadata connector（`connector_instance` 表）发现：
+         取 server_uri / transport / auth_type，并从运行时 ConnectorManager 的
+         MCPToolPack 拿已解密的 headers。
+
+    OpenMetadata 不可用时（enabled=False），紧凑表清单与 get_table_schema 走 Kyuubi 兜底。
+    """
+    from dbgpt.agent.util.openmetadata_client import OpenMetadataConfig
+
+    defaults = OpenMetadataConfig()
+    # 1) TOML 显式配置
+    try:
+        app_config = CFG.SYSTEM_APP.config.configs.get("app_config")
+        web_config = getattr(getattr(app_config, "service", None), "web", None)
+        agent_context = getattr(web_config, "agent_context", None)
+        if agent_context is not None:
+
+            def _v(name: str, default: Any) -> Any:
+                value = getattr(agent_context, name, None)
+                return default if value is None else value
+
+            cfg = OpenMetadataConfig(
+                enabled=bool(_v("openmetadata_enabled", False)),
+                server_uri=str(_v("openmetadata_server_uri", "")),
+                transport=str(_v("openmetadata_transport", "sse")),
+                auth_type=str(_v("openmetadata_auth_type", "none")),
+                token=str(_v("openmetadata_token", "")),
+                header_name=str(_v("openmetadata_header_name", "Authorization")),
+                schema=str(_v("openmetadata_schema", "")),
+                list_tables_tool=str(_v("openmetadata_list_tables_tool", "")),
+                table_schema_tool=str(_v("openmetadata_table_schema_tool", "")),
+                list_tables_arg=str(_v("openmetadata_list_tables_arg", "schema")),
+                table_schema_arg=str(_v("openmetadata_table_schema_arg", "table_name")),
+                description_max_chars=int(
+                    _v("openmetadata_description_max_chars", 0)
+                ),
+                cache_ttl_seconds=int(
+                    _v("openmetadata_cache_ttl_seconds", _OM_CACHE_TTL)
+                ),
+            )
+            if cfg.enabled and cfg.server_uri:
+                return cfg
+    except Exception:
+        logger.debug("Failed to load OpenMetadata TOML config; disabled", exc_info=True)
+
+    # 2) 自动从前端 connector_instance 发现 openmetadata
+    try:
+        from dbgpt.agent.resource.connector.credential import CredentialStore
+        from dbgpt.agent.resource.connector.manager import (
+            ConnectorManager as _AgentConnectorManager,
+        )
+        from dbgpt_serve.connector.models.models import ConnectorInstanceEntity
+        from dbgpt_serve.connector.service.service import ConnectorService
+
+        svc = ConnectorService.get_instance(CFG.SYSTEM_APP)
+        for c in svc.list_connectors() or []:
+            label = f"{c.display_name or ''} {c.connector_type or ''}".lower()
+            if "openmetadata" not in label:
+                continue
+            cfg_map = c.config or {}
+            server_uri = cfg_map.get("server_uri")
+            if not server_uri:
+                continue
+            transport = str(cfg_map.get("transport") or "sse")
+            auth_type = str(cfg_map.get("auth_type") or "none")
+            headers = None
+            # (a) 优先从运行时 MCPToolPack 拿已解密 headers（重水合成功时）
+            try:
+                cm = _AgentConnectorManager.get_instance(CFG.SYSTEM_APP)
+                pack = cm.get_connector_tools(c.connector_id)
+                if pack is not None:
+                    servers = list(getattr(pack, "_mcp_servers", []) or [])
+                    if servers:
+                        headers = dict(
+                            (getattr(pack, "server_headers_map", None) or {}).get(
+                                servers[0], {}
+                            )
+                        ) or None
+            except Exception as e:
+                logger.debug(f"OpenMetadata headers from connector pack failed: {e}")
+            # (b) 兜底：直接从 DB 解密凭证（connector 重水合在 uvicorn 循环里
+            #     run_until_complete 可能抛 "this event loop is already running"，
+            #     导致 _active_packs 为空，pack 拿不到）
+            if not headers:
+                try:
+                    enc_creds = salt = None
+                    with svc._dao.session() as session:
+                        entity = (
+                            session.query(ConnectorInstanceEntity)
+                            .filter(
+                                ConnectorInstanceEntity.connector_id == c.connector_id
+                            )
+                            .first()
+                        )
+                        if entity is not None:
+                            # 必须在 session 内取出标量字段，否则退出 session 后
+                            # 懒加载会抛 "not bound to a Session"
+                            enc_creds = entity.encrypted_credentials
+                            salt = entity.encryption_salt
+                    if enc_creds and salt:
+                        creds = CredentialStore(
+                            system_app=CFG.SYSTEM_APP
+                        ).decrypt(enc_creds, salt)
+                        token = str(creds.get("token", "") or "")
+                        if token:
+                            headers = {
+                                "Authorization": (
+                                    token if token.startswith("Bearer ") else f"Bearer {token}"
+                                )
+                            }
+                except Exception as e:
+                    logger.warning(f"OpenMetadata credentials decrypt failed: {e}")
+            logger.info(
+                f"Auto-detected OpenMetadata connector: {c.display_name} @ {server_uri} "
+                f"transport={transport} auth={auth_type} headers_set={bool(headers)} "
+                f"headers_keys={list(headers or {})}"
+            )
+            return OpenMetadataConfig(
+                enabled=True,
+                server_uri=server_uri,
+                transport=transport,
+                auth_type=auth_type,
+                headers=headers,
+            )
+    except Exception as e:
+        logger.debug(f"OpenMetadata connector auto-detect failed: {e}")
+    return defaults
+
+
+async def _build_compact_catalog(
+    database_connector: Any, conv_id: str, om_config: "OpenMetadataConfig"
+) -> str:
+    """构造会话级紧凑表清单（表名 + 描述），并写入 conv_id 维度会话缓存。
+
+    优先 OpenMetadata（数据目录，含业务描述）；未启用/失败时降级到 Kyuubi
+    （仅表名清单）。全部 try/except 包裹，不阻塞主流程。
+    """
+    from dbgpt.agent.util.openmetadata_client import OpenMetadataClient
+
+    lines: List[str] = []
+    if om_config.enabled and om_config.server_uri:
+        try:
+            # schema 为空时从 DB connector 推导（如 Kyuubi get_current_db_name -> st_embed）
+            if not om_config.schema and database_connector is not None:
+                getter = getattr(database_connector, "get_current_db_name", None)
+                if callable(getter):
+                    try:
+                        om_config.schema = getter() or ""
+                    except Exception:
+                        om_config.schema = ""
+            client = OpenMetadataClient(om_config)
+            # REST 直连优先（确定性、带业务描述）；失败/为空再走 MCP
+            tables = await client.list_tables_rest()
+            source = "OpenMetadata(REST)"
+            if not tables:
+                tables = await client.list_tables()
+                source = "OpenMetadata(MCP)"
+            for t in tables or []:
+                name = t.get("name", "")
+                desc = t.get("description", "")
+                lines.append(f"- {name}: {desc}" if desc else f"- {name}")
+            if lines:
+                logger.info(
+                    f"Built compact catalog from {source}: {len(lines)} tables"
+                )
+        except Exception as e:
+            logger.warning(f"OpenMetadata compact catalog failed: {e}")
+    if not lines and database_connector is not None:
+        # Kyuubi / DB 兜底：仅表名清单
+        try:
+            table_names = list(database_connector.get_table_names())
+            lines = [f"- {name}" for name in table_names]
+        except Exception as e:
+            logger.warning(f"Kyuubi compact catalog failed: {e}")
+            lines = []
+    catalog = "\n".join(lines) if lines else "- (未获取到表清单)"
+    _TABLE_CATALOG_CACHE[conv_id] = (time.time(), catalog)
+    return catalog
+
+
+async def _build_glossary_section(om_config: "OpenMetadataConfig") -> str:
+    """从 OpenMetadata 术语库拉取业务术语，压缩为 system prompt 段（进程级缓存）。
+
+    按术语库名缓存，TTL 内复用、过期重新拉取（同步 OpenMetadata 更新）；
+    失败/未启用返回空串，不阻塞主流程。
+    """
+    if not (om_config.enabled and om_config.server_uri):
+        return ""
+    cached = _GLOSSARY_CACHE.get(_GLOSSARY_NAME)
+    if _is_cache_fresh(cached, om_config.cache_ttl_seconds):
+        return cached[1]
+    try:
+        from dbgpt.agent.util.openmetadata_client import OpenMetadataClient
+
+        terms = await OpenMetadataClient(om_config).list_glossary_terms(
+            _GLOSSARY_NAME, _GLOSSARY_WHITELIST
+        )
+        if not terms:
+            return ""
+        lines = ["## 业务术语与口径"]
+        for name, desc in terms.items():
+            lines.append(f"- {name}: {desc}")
+        section = "\n".join(lines)
+        _GLOSSARY_CACHE[_GLOSSARY_NAME] = (time.time(), section)
+        logger.info(
+            f"Built glossary section from OpenMetadata: {len(terms)} terms"
+        )
+        return section
+    except Exception as e:
+        logger.warning(f"Build glossary section failed: {e}")
+        return ""
 
 
 def _extract_auto_data_markers(text: str) -> tuple[str, Dict[str, str]]:
@@ -1576,6 +1829,9 @@ async def _react_agent_stream(
     # Step 1: 预加载所有技能到 registry（递归扫描 skills_dir）
     load_skills_from_dir(skills_dir, recursive=True)
     all_skills = registry.list_skills()
+    # 排除不需要的示例技能，避免占用 system prompt 上下文（仅影响技能清单展示）
+    _EXCLUDED_SKILLS = {"walmart-sales-analyzer", "financial-report-analyzer"}
+    all_skills = [s for s in all_skills if s.name not in _EXCLUDED_SKILLS]
 
     # Step 2: 从 ResourceManager 收集已注册的业务工具
     # 这些工具由其他模块注册（如 datasource、自定义 @tool），将和文件内
@@ -1630,17 +1886,14 @@ async def _react_agent_stream(
 
     # Step 4: 加载数据库 connector 与向量库表结构检索
     # ─────────────────────────────────────────────────────────────
-    # 【上下文注入点 #1：向量库表结构检索】
-    # 每次请求只要 database_name 非空就会执行：
-    #   1. get_table_info_no_throw() — Trino 下返回空（MetaData.reflect 被 patch 成 no-op）
-    #   2. get_db_summary(top_k=20) — 向量库检索 top-20 张表，拼到 db_summary_context
-    #   3. db_summary_context 在 L3658-3662 被拼进 user message
-    # ⚠️ 重复风险：每个新问题都会重新检索 top-20 表，导致上下文里反复出现表结构
+    # 【上下文注入点 #1：数据库连接与紧凑表清单】
+    # 只要 database_name 非空：
+    #   1. 取 connector（Kyuubi/Trino 等）
+    #   2. 会话级紧凑表清单（OpenMetadata 优先、Kyuubi 兜底，conv_id 维度缓存）
+    #   3. 完整表结构不再预注入，由 get_table_schema 工具按需获取
     # ─────────────────────────────────────────────────────────────
     database_connector = None
     database_context = ""  # 注入到 system prompt 的 {database_context} 占位符
-    # db_summary_context 最终会拼到 user message 里（见 L3658-3662）
-    db_summary_context = ""
     if database_name:
         try:
             # 取数据库连接器（从 ConnectorManager 单例）
@@ -1648,49 +1901,35 @@ async def _react_agent_stream(
             database_connector = local_db_manager.get_connector(database_name)
             # 列出所有表名
             table_names = list(database_connector.get_table_names())
-            # 尝试获取表结构（DDL）
-            table_info = database_connector.get_table_info_no_throw()
-            # Trino 等不 reflect 的 connector 会返回空，走向量库补
-            # ⚠️ 只要 table_info 为空，每个新问题都会重新跑 get_db_summary
-            if not table_info or not table_info.strip():
-                try:
-                    from dbgpt_serve.datasource.service.db_summary_client import (
-                        DBSummaryClient,
-                    )
-
-                    summary_client = DBSummaryClient(system_app=CFG.SYSTEM_APP)
-                    # 向量库检索：top_k=20 张与 user_input 最相关的表
-                    # 字段检索在 DBSchemaRetriever._retrieve_field 里全量返回
-                    table_infos = summary_client.get_db_summary(
-                        database_name,
-                        user_input,
-                        20,
-                    )
-                    if table_infos:
-                        # 把检索到的表结构拼到 db_summary_context，
-                        # 后续会在注入点 #3 拼到 user message 末尾
-                        db_summary_context = (
-                            "\n\n## 相关表结构（来自向量库检索）\n"
-                            + "\n\n".join(table_infos)
-                        )
-                        logger.info(
-                            f"Retrieved {len(table_infos)} table summaries "
-                            f"from vector store for db={database_name}"
-                        )
-                except Exception as se:
-                    # 向量库检索失败仅记日志，不影响主流程
-                    logger.warning(
-                        f"Failed to retrieve db summary from vector store: {se}",
-                        exc_info=se,
-                    )
+            # 会话级紧凑表清单：优先 OpenMetadata（数据目录，含表描述），
+            # 失败/未启用降级 Kyuubi（仅表名）。缓存到 conv_uid 维度，会话内复用，
+            # 不再每问从 chromadb 检索 top-20 塞进上下文（避免膨胀与重复）。
+            # 注：此处不能用 conv_id —— 它在本函数更后面才赋值（UnboundLocalError）。
+            catalog_key = dialogue.conv_uid or ""
+            om_config = _load_openmetadata_config()
+            _cached_catalog = _TABLE_CATALOG_CACHE.get(catalog_key)
+            # TTL 内复用；过期/缺失则重新拉取（同步 OpenMetadata 元数据更新）
+            db_catalog = (
+                _cached_catalog[1]
+                if _is_cache_fresh(_cached_catalog, om_config.cache_ttl_seconds)
+                else None
+            )
+            if db_catalog is None:
+                db_catalog = await _build_compact_catalog(
+                    database_connector,
+                    catalog_key,
+                    om_config,
+                )
+            # 业务术语与口径：从 OpenMetadata 术语库拉取（进程级缓存，如"商规EMBED生产测试术语库"）
+            glossary_section = await _build_glossary_section(om_config)
             # database_context 注入到 system prompt 的 {database_context} 占位符
             database_context = f"""
 ## 数据库信息
 - 数据库名: {database_name}
-- 可用表: {", ".join(table_names)}
-- 表结构:
-{table_info}
-- 使用 'sql_query' 工具执行 SQL 查询
+{db_catalog}
+{glossary_section}
+- 使用 'sql_query' 工具执行 SQL 查询；若不确定列名，先用 'get_table_schema' 查看表结构
+- 需要理解 errorcode/测项/指标等业务术语含义时，先用 'get_glossary_term' 查询术语库
 - **只允许 SELECT 查询，禁止 INSERT/UPDATE/DELETE/DROP/ALTER/TRUNCATE**
 """
             logger.info(
@@ -2434,6 +2673,103 @@ print(json.dumps(summary, ensure_ascii=False))
                 },
                 ensure_ascii=False,
             )
+
+    @tool(
+        description=(
+            "返回指定表的完整结构（列名/类型/描述），供编写 SQL 前确认列名。"
+            '参数: {"table_name": "表名"}'
+        )
+    )
+    async def get_table_schema(table_name: str) -> str:
+        """按需返回指定表结构（列名/类型/描述）。
+
+        优先 OpenMetadata（数据目录，业务描述全，可配置）；失败/未启用回退
+        Kyuubi（database_connector.get_table_info / get_columns）。均 try/except，
+        返回文本，不抛异常。
+
+        Args:
+            table_name: 表名
+
+        Returns:
+            str: 表结构文本（OpenMetadata 原文 / Kyuubi DDL / columns JSON / 错误信息）
+        """
+        if not table_name:
+            return json.dumps({"error": "table_name 不能为空"}, ensure_ascii=False)
+        # 1) OpenMetadata（可配置，失败静默降级）
+        try:
+            om_cfg = _load_openmetadata_config()
+            if om_cfg.enabled and om_cfg.server_uri:
+                from dbgpt.agent.util.openmetadata_client import OpenMetadataClient
+
+                # schema 为空时从 DB connector 推导（如 Kyuubi get_current_db_name -> st_embed）
+                if not om_cfg.schema and database_connector is not None:
+                    getter = getattr(database_connector, "get_current_db_name", None)
+                    if callable(getter):
+                        try:
+                            om_cfg.schema = getter() or ""
+                        except Exception:
+                            om_cfg.schema = ""
+                schema_text = await OpenMetadataClient(om_cfg).get_table_schema(
+                    table_name
+                )
+                if schema_text and schema_text.strip():
+                    return schema_text
+        except Exception as e:
+            logger.warning(f"get_table_schema(OpenMetadata) failed: {e}")
+        # 2) Kyuubi / DB 兜底
+        try:
+            if database_connector is not None:
+                table_info = database_connector.get_table_info([table_name])
+                if table_info and table_info.strip():
+                    return table_info
+                columns = database_connector.get_columns(table_name)
+                if columns:
+                    return json.dumps(
+                        {"table_name": table_name, "columns": columns},
+                        ensure_ascii=False,
+                    )
+        except Exception as e:
+            logger.warning(f"get_table_schema(Kyuubi) failed: {e}")
+        return json.dumps(
+            {"error": f"无法获取表 {table_name} 的结构"}, ensure_ascii=False
+        )
+
+    @tool(
+        description=(
+            "查询 OpenMetadata 术语库中某个业务术语的详细定义（如 ErrorCode、测项、指标口径）。"
+            "当需要理解 errorcode 含义、测项定义、指标来源时调用。"
+            '参数: {"term_name": "术语名，如 不良代码（ErrorCode）、ECC测试项"}'
+        )
+    )
+    async def get_glossary_term(term_name: str) -> str:
+        """按需从术语库取某个业务术语的完整定义（errorcode/测项/指标等）。
+
+        Args:
+            term_name: 术语名（模糊匹配，取相同名优先）
+
+        Returns:
+            str: 术语完整定义 JSON / 未找到错误
+        """
+        om_cfg = _load_openmetadata_config()
+        if not (om_cfg.enabled and om_cfg.server_uri):
+            return json.dumps(
+                {"error": "OpenMetadata 未配置，无法查询术语库"}, ensure_ascii=False
+            )
+        try:
+            from dbgpt.agent.util.openmetadata_client import OpenMetadataClient
+
+            desc = await OpenMetadataClient(om_cfg).get_glossary_term(
+                _GLOSSARY_NAME, term_name
+            )
+            if desc:
+                return json.dumps(
+                    {"term": term_name, "definition": desc}, ensure_ascii=False
+                )
+        except Exception as e:
+            logger.warning(f"get_glossary_term failed: {e}")
+        return json.dumps(
+            {"error": f"未找到术语 {term_name}"}, ensure_ascii=False
+        )
 
     def _try_repair_truncated_code(raw_code: str) -> Optional[str]:
         """尝试修复被 LLM token 上限截断的代码。
@@ -4089,6 +4425,10 @@ IMPORTANT: You MUST call todowrite again after EACH task completes to update sta
 The user sees progress in real time — never skip an update.
 Parameters: {{"todos": [{{...}}]}}
 15. **terminate**: Finish the task. Parameters: {{"result": "final answer"}}
+16. **get_table_schema**: Return the full structure (columns/types/descriptions) of a specified table. Use it before writing SQL if you are unsure about column names.
+Parameters: {{"table_name": "table name"}}
+17. **get_glossary_term**: Query the business glossary for a term's detailed definition (ErrorCode / test item / indicator semantics). Use it when you need to understand errorcode meaning, test item definition, or indicator sourcing.
+Parameters: {{"term_name": "term name"}}
 
 {file_context}
 {knowledge_context}
@@ -4119,6 +4459,8 @@ Action Input: The JSON format of tool parameters
                 shell_interpreter,
                 html_interpreter,
                 sql_query,
+                get_table_schema,   # 按需取表结构（OpenMetadata/Kyuubi）
+                get_glossary_term,  # 按需查术语库（errorcode/测项/指标含义）
                 todowrite,
                 Terminate(),
             ]
@@ -4222,6 +4564,20 @@ Action Input: The JSON format of tool parameters
         pass  # graceful degradation  # connector 系统 prompt 注入失败时静默降级
     # --- End connector system prompt injection ---
 
+    # --- Inject task_progress placeholder into system prompt ---
+    # task_progress_summary 由 role.py 维护（全部已完成 step 的紧凑摘要，不随
+    # ShortTermMemory buffer 淘汰），通过 context["task_progress"] 传入 build_system_prompt。
+    # 这里加 jinja2 占位符，让它在 system prompt 中真正渲染，避免被静默丢弃。
+    # 用普通字符串（非 f-string）追加，避免对 {{ }} 做转义。
+    # 注意：task_progress_summary 自身已以 "## Task Progress" 开头，这里不再重复标题。
+    workflow_prompt += """
+{% if task_progress %}
+{{ task_progress }}
+You MUST NOT repeat any action already listed above as completed.
+Pick the NEXT action that has NOT been done yet to make progress toward the final goal.
+{% endif %}
+"""
+
     # Convert workflow_prompt to PromptTemplate so it is used as system prompt
     # Use jinja2 format to avoid issues with JSON braces { } in the prompt
     # 把 workflow_prompt 包装成 PromptTemplate 作为 system prompt
@@ -4242,17 +4598,17 @@ Action Input: The JSON format of tool parameters
     )
 
     agent = await agent_builder.build()  # 异步构建 agent（会从 gpts_messages 恢复历史到 ShortTermMemory）
+    # 互补语义：历史由 historical_dialogues（chat_history 表，下方加载）承担；
+    # 清空 build() 恢复到 ShortTermMemory 的历史，使 memory_list 只包含本轮运行的 ReAct step
+    # （避免"历史轮次在 historical_dialogues 与 memory_list 两路径重复"）
+    await agent.memory.clear()
 
     parser = ReActOutputParser()  # ReAct 输出解析器（解析 Thought/Action/Action Input）
     # ─────────────────────────────────────────────────────────────
-    # 【上下文注入点 #3：user message 拼接向量库检索结果】
-    # 将 db_summary_context（向量库 top-20 表结构）拼到 user_input 后面
-    # ⚠️ 每次请求都会拼接，导致每个新问题的 user message 都带表结构
+    # 用户消息不再拼接向量库检索的表结构（紧凑表清单已在 system prompt 的
+    # {database_context} 中，完整表结构通过 get_table_schema 工具按需获取）
     # ─────────────────────────────────────────────────────────────
-    _received_content = user_input  # 用户原始输入
-    if db_summary_context:  # 如果有向量库检索到的表结构上下文
-        _received_content = f"{user_input}{db_summary_context}"  # 拼到 user_input 后面
-    received = AgentMessage(content=_received_content)  # 构造 AgentMessage
+    received = AgentMessage(content=user_input)  # 构造 AgentMessage
     stream_queue: asyncio.Queue = asyncio.Queue()  # 事件队列：agent 回调写、SSE 主循环读
 
     # Wire up context-management status events into the SSE stream.
@@ -4295,9 +4651,19 @@ Action Input: The JSON format of tool parameters
         for m in hist_msgs or []:  # 遍历每条历史
             content = m.context if hasattr(m, "context") else ""  # 取 context 字段
             role_str = m.role if hasattr(m, "role") else "human"  # 取角色
-            # 跳过 view 类型消息（渲染视图，非用户或 AI 文本回复）
-            # 跳过 view 类型消息（渲染视图，非用户或 AI 文本回复）
             if role_str == "view":
+                # AI 回复在本 API 里以 view 消息保存（history_payload，见下方
+                # add_view_message），不再是纯展示。这里从 payload 提取 final_content
+                # 作为 AI 回复注入 historical_dialogues，避免历史 AI 回复全部丢失。
+                try:
+                    payload = json.loads(content)
+                    final = payload.get("final_content")
+                    if final:
+                        historical_dialogues.append(
+                            AgentMessage(content=final, role=_Role.AI)
+                        )
+                except Exception:
+                    pass  # 解析失败则跳过该 view（不中断加载）
                 continue
             historical_dialogues.append(  # 追加到列表
                 AgentMessage(
@@ -4315,7 +4681,7 @@ Action Input: The JSON format of tool parameters
 
     async def run_agent():  # 启动 agent 的协程任务
         return await agent.generate_reply(
-            received_message=received,  # 接收消息（含 db_summary_context）
+            received_message=received,  # 接收消息（user_input，无 schema 拼接）
             sender=agent,  # 发送者 = agent 自身
             stream_callback=stream_callback,  # 流式回调
             # historical_dialogues 在 base_agent.py L1357-1371 被合并进 agent_messages

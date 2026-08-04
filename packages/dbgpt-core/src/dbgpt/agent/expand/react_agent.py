@@ -276,7 +276,7 @@ class ReActAgent(ConversableAgent):
         observation: str,
     ) -> Union[str, List["AgentMessage"]]:
         # 【上下文读取点：从 ShortTermMemory 读取历史 ReAct step】
-        # self.memory.read() 返回 ShortTermMemory._fragments（最近 5 个 fragment）
+        # self.memory.read() 返回 ShortTermMemory._fragments（最近 8 个 fragment）
         # 每个 fragment 的 raw_observation 是 JSON，含 question/thought/action/observation
         # 这里把 JSON 解析回 List[AgentMessage]（Question→HUMAN, Thought/Action→AI, Observation→HUMAN）
         # 返回的列表在 base_agent.py L1405 被 extend 进 agent_messages

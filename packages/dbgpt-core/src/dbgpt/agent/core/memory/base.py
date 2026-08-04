@@ -707,11 +707,12 @@ class ShortTermMemory(Memory, Generic[T]):
 
     All memories are stored in computer memory.
 
-    buffer_size=5 表示最多保留 5 个 MemoryFragment。
+    buffer_size=5 表示最多保留 5 个 MemoryFragment（本类默认值）。
     每个 fragment 对应一个 ReAct step（Question/Thought/Action/Observation 组合），
     不是 5 轮用户对话或 5 条原始消息。
     超过 buffer_size 时，最老的 fragment 会被转给 LongTermMemory（如果配置了），
     否则被丢弃。当前 /v1/chat/react-agent 接口未启用 LongTermMemory，所以是直接丢弃。
+    （AgentMemory 实际以 buffer_size=10 构造，见 agent_memory.py。）
 
     数据来源：agent.build() 时从 gpts_messages 表恢复（见 base_agent.py L219-229），
     以及每轮 verify 后 write_memories 写入。
