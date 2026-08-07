@@ -3449,12 +3449,16 @@ print(json.dumps(summary, ensure_ascii=False))
 
     @tool(  # @tool 装饰器：注册为 agent 可调用的 HTML 渲染工具
         description="将 HTML 渲染为可交互的网页报告，这是向用户展示网页报告的唯一方式。"  # 工具说明（向 LLM 描述）
+        "【一次性】一次调用即可把【完整】报告渲染出来；同一份报告【禁止】"
+        "重复调用本工具，渲染成功后若目标已达成请直接 terminate。"
         "【默认用法】直接传入完整的 HTML 字符串："
         '{"html": "<html>...</html>", "title": "报告标题"}。'
         "你需要自己生成完整的 HTML 代码"
         "（包含 <!DOCTYPE html>、<html>、<head>、<body> 等），"
         "然后传给 html 参数即可。"
-        "HTML 可以很长，没有长度限制，不需要分段传入。"
+        "HTML 可以很长，没有长度限制，不需要分段传入；"
+        "若报告含多部分内容，请合并进【同一份】HTML 一次性渲染，"
+        "不要分多次生成多份报告。"
         "【禁止】不要用 code_interpreter 写 HTML 再 print，"
         "不要用 code_interpreter 把 HTML 写入文件再读取，"
         "直接把 HTML 传给本工具即可。"
@@ -3800,7 +3804,15 @@ print(json.dumps(summary, ensure_ascii=False))
         except Exception:
             pass
 
-        chunks: List[Dict[str, Any]] = [  # 最终输出：单个 html chunk
+        chunks: List[Dict[str, Any]] = [  # 最终输出：先给模型一条完成回执，再返回 html chunk
+            {
+                "output_type": "text",
+                "content": (
+                    "✅ HTML 报告已成功渲染并展示给用户。报告任务已完成，"
+                    "请勿重复调用 html_interpreter 生成报告。"
+                    "若全部目标已达成，请直接调用 terminate 结束。"
+                ),
+            },
             {"output_type": "html", "content": fixed_html, "title": title},
         ]
         return json.dumps({"chunks": chunks}, ensure_ascii=False)
