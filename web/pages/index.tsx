@@ -514,6 +514,9 @@ const Playground: NextPage = () => {
   const { model, setModel } = useContext(ChatContext);
   const [query, setQuery] = useState('');
   const [loading, setLoading] = useState(false);
+  // 当前对话是否正在运行中（由 live 轮询驱动，独立于本页发起的 SSE）。
+  // 用于：切换/重载后回到一个仍在运行的对话时，发送按钮保持转圈禁用。
+  const [convRunning, setConvRunning] = useState(false);
 
   // Selection State
   const [isDbModalOpen, setIsDbModalOpen] = useState(false);
@@ -598,6 +601,10 @@ const Playground: NextPage = () => {
   // time so "保存定时任务" can replay the real execution (file / database /
   // knowledge / skill / connectors) instead of a drifting UI state.
   const lastSentPayloadRef = useRef<ChatReplayPayload | null>(null);
+  const loadSeqRef = useRef(0); // 历史对话加载请求序号，防快速切换时旧响应覆盖
+  const livePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // refresh 后实时渲染：live view 消息的 id（一次创建，轮询只增量更新 executionMap）
+  const liveViewIdRef = useRef<string | null>(null);
 
   const [historyLoading, setHistoryLoading] = useState(false);
   const [contextStatus, setContextStatus] = useState<{
@@ -716,6 +723,43 @@ const Playground: NextPage = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
+  // 卸载时停止 live 轮询
+  useEffect(() => {
+    return () => {
+      if (livePollRef.current) clearInterval(livePollRef.current);
+    };
+  }, []);
+
+  // 自动绑定默认数据源：新对话未选数据源时，默认选中 st_embed（避免每次手动选）
+  useEffect(() => {
+    if (!selectedDb && dataSources && dataSources.length > 0) {
+      const def = dataSources.find((ds: DataSource) => ds.db_name === 'st_embed') || dataSources[0];
+      if (def) setSelectedDb(def);
+    }
+  }, [dataSources, selectedDb]);
+
+  // 自动选中 OpenMetadata connector（与数据源自动绑定同理）：否则每次都要手动
+  // 点连接 MCP，get_glossary_term 查术语库才会通。仅在首次加载、且用户尚未
+  // 主动操作连接器时生效，避免覆盖用户的增删选择。
+  const omAutoSelectedRef = useRef(false);
+  useEffect(() => {
+    if (omAutoSelectedRef.current) return;
+    if (!connectorsList || connectorsList.length === 0) return;
+    const om = (connectorsList as ConnectorInstance[]).find(
+      c =>
+        c.status === 'active' &&
+        ((c.connector_type || '').toLowerCase().includes('openmetadata') ||
+          (c.display_name || '').toLowerCase().includes('openmetadata')),
+    );
+    if (om) {
+      setSelectedConnectors(prev => {
+        if (prev.some(s => s.id === om.id)) return prev;
+        return [...prev, om];
+      });
+    }
+    omAutoSelectedRef.current = true;
+  }, [connectorsList]);
+
   useEffect(() => {
     const convId = router.query.id as string | undefined;
     if (convId && convId !== conversationId) {
@@ -728,6 +772,8 @@ const Playground: NextPage = () => {
       setExecutionMap({});
       setActiveMessageId(null);
       setActiveViewMsgId(null);
+      setSelectedStepId(null);
+      setConvRunning(false);
       setUploadedFilePath(null);
       setFilePreview(null);
       setFilePreviewError(null);
@@ -1422,7 +1468,12 @@ const Playground: NextPage = () => {
     const effectiveFile = overrideFile !== undefined ? overrideFile : uploadedFile;
     const effectiveSkill = overrideSkill !== undefined ? overrideSkill : selectedSkill;
     const effectiveDb = overrideDb !== undefined ? overrideDb : selectedDb;
-    if ((!inputQuery.trim() && !effectiveFile) || loading) return;
+    if (!inputQuery.trim() && !effectiveFile) return;
+    if (loading) {
+      // 上一轮仍在处理：给出提示而不是静默丢弃，避免"发消息没反应"的困惑
+      message.warning('上一轮还在处理中，请稍候再发送');
+      return;
+    }
 
     let finalQuery = inputQuery;
     const appCode = 'chat_react_agent';
@@ -1489,6 +1540,10 @@ const Playground: NextPage = () => {
     const currentConvId = conversationId || generateUUID();
     if (!conversationId) {
       setConversationId(currentConvId);
+      // 让刷新后能按 id 恢复会话：否则 F5 后 URL 仍是 /，当前提问会"消失"。
+      // conversationId 与 router.query.id 同步提交，query.id 变化时 effect 中
+      // convId === conversationId，不会触发重复 loadConversation。
+      router.replace(`/?id=${currentConvId}`, undefined, { shallow: true });
     }
 
     // Calculate current order
@@ -1576,7 +1631,7 @@ const Playground: NextPage = () => {
       model_name: model,
       select_param: selectParam,
       temperature: 0.6,
-      max_new_tokens: 4000,
+      max_new_tokens: 16000,
       ext_info: extInfo,
     };
 
@@ -1592,7 +1647,7 @@ const Playground: NextPage = () => {
           model_name: model,
           user_input: finalQuery,
           temperature: 0.6,
-          max_new_tokens: 4000,
+          max_new_tokens: 16000,
           select_param: selectParam,
           ext_info: extInfo,
         }),
@@ -1730,10 +1785,9 @@ const Playground: NextPage = () => {
             });
             return;
           }
-          // Clear manual step selection so the right panel auto-tracks this step
-          if (payload.action) {
-            setSelectedStepId(null);
-          }
+          // 注意：不要在这里清空 selectedStepId —— 用户手动点击选中的步骤应保持稳定，
+          // 否则后续任何 action 的 step.meta 都会把右面板从用户正在查看的步骤上抢走。
+          // 未点击时 selectedStepId 为 null，右面板自然跟随 activeStepId 自动跟踪最新步骤。
           setExecutionMap(prev => {
             const current = prev[responseId];
             if (!current) return prev;
@@ -2079,6 +2133,8 @@ const Playground: NextPage = () => {
     setExecutionMap({});
     setActiveMessageId(null);
     setActiveViewMsgId(null);
+    setSelectedStepId(null);
+    setConvRunning(false);
     setUploadedFilePath(null);
     setFilePreview(null);
     setFilePreviewError(null);
@@ -2095,6 +2151,7 @@ const Playground: NextPage = () => {
     setExecutionMap({});
     setActiveMessageId(null);
     setActiveViewMsgId(null);
+    setSelectedStepId(null);
     setArtifacts([]);
     setStreamingSummary('');
     setSummaryComplete(false);
@@ -2253,11 +2310,172 @@ const Playground: NextPage = () => {
     }
   };
 
+  const stopLivePolling = () => {
+    if (livePollRef.current) {
+      clearInterval(livePollRef.current);
+      livePollRef.current = null;
+    }
+  };
+
+  // 增量更新某个 view 消息的 executionMap（复用同一 viewId，避免整页重建/重挂载）
+  const applyLiveSteps = (viewId: string, steps: any[]) => {
+    setExecutionMap(prev => {
+      const current = prev[viewId] || {
+        steps: [] as ExecutionStep[],
+        outputs: {} as Record<string, ExecutionOutput[]>,
+        activeStepId: null,
+        collapsed: false,
+        stepThoughts: {} as Record<string, string>,
+      };
+      const nextSteps: ExecutionStep[] = (steps || []).map((s: any, idx: number) => ({
+        id: s.id || `live-${idx}`,
+        step: idx + 1,
+        title: s.title || s.action || `Step ${idx + 1}`,
+        detail: s.detail || '',
+        status:
+          s.status === 'failed'
+            ? ('failed' as const)
+            : s.status === 'running'
+              ? ('running' as const)
+              : ('done' as const),
+        action: s.action || undefined,
+        actionInput: s.action_input || undefined,
+        todoMeta: s.todo_meta || undefined,
+      }));
+      const outputs: Record<string, ExecutionOutput[]> = {};
+      const stepThoughts: Record<string, string> = {};
+      (steps || []).forEach((s: any, idx: number) => {
+        const id = s.id || `live-${idx}`;
+        if (Array.isArray(s.outputs)) {
+          outputs[id] = s.outputs.map((o: any) => ({
+            output_type: o.output_type || 'text',
+            content: o.content,
+          }));
+        }
+        // 兜底：code_interpreter/shell_interpreter 从 action_input 提取代码
+        if ((s.action === 'code_interpreter' || s.action === 'shell_interpreter') && s.action_input) {
+          const existing = outputs[id] || [];
+          if (!existing.some((o: ExecutionOutput) => o.output_type === 'code')) {
+            try {
+              const input = typeof s.action_input === 'string' ? JSON.parse(s.action_input) : s.action_input;
+              if (input && input.code) {
+                outputs[id] = [{ output_type: 'code', content: input.code }, ...existing];
+              }
+            } catch {
+              /* ignore */
+            }
+          }
+        }
+        const thought = s.action_intention
+          ? s.action_reason
+            ? `${s.action_intention}\n${s.action_reason}`
+            : s.action_intention
+          : s.thought;
+        if (thought && typeof thought === 'string') {
+          stepThoughts[id] = thought;
+        }
+      });
+      // 保留用户当前选中的 step；否则自动聚焦到最新一步
+      const activeStepId =
+        current.activeStepId && nextSteps.some(s => s.id === current.activeStepId)
+          ? current.activeStepId
+          : nextSteps.length > 0
+            ? nextSteps[nextSteps.length - 1].id
+            : null;
+      return {
+        ...prev,
+        [viewId]: {
+          ...current,
+          steps: nextSteps,
+          outputs,
+          activeStepId,
+          stepThoughts,
+        },
+      };
+    });
+  };
+
+  // 首次轮询发现运行中：只建一次 human+view 消息，之后每轮只增量更新 executionMap。
+  // 与"没刷新"时的实时渲染体验一致：问题 + 步骤卡片 + 可点击查看 action 输出。
+  const renderLiveSteps = (viewId: string, steps: any[]) => {
+    applyLiveSteps(viewId, steps);
+  };
+
+  // 检查某会话是否运行中：若是则显示实时进度并轮询，请求结束后重新加载最终历史
+  const checkLive = async (convUid: string) => {
+    stopLivePolling();
+    liveViewIdRef.current = null;
+    try {
+      const res: any = await axios.get(`/api/v1/chat/dialogue/live?con_uid=${convUid}`);
+      const data = res?.data?.data || res?.data;
+      if (data?.running) {
+        setConvRunning(true);
+        const viewId = generateUUID();
+        liveViewIdRef.current = viewId;
+        // 只建一次消息：human（原问题）+ view（空上下文，steps 由轮询填充）
+        setMessages(prev => {
+          if (prev.some(m => m.role === 'view')) return prev; // 已有 view（异常情况）不重复建
+          const hasHuman = prev.some(m => m.role === 'human');
+          const humanMsg = hasHuman
+            ? []
+            : [
+                {
+                  id: generateUUID(),
+                  role: 'human' as const,
+                  context: data.user_input || '（该对话正在运行中）',
+                  order: prev.length,
+                },
+              ];
+          return [
+            ...prev,
+            ...humanMsg,
+            {
+              id: viewId,
+              role: 'view' as const,
+              context: '',
+              order: prev.length + humanMsg.length,
+              thinking: false,
+            },
+          ];
+        });
+        setActiveViewMsgId(viewId);
+        setRightPanelCollapsed(false);
+        renderLiveSteps(viewId, data.steps || []);
+        livePollRef.current = setInterval(async () => {
+          try {
+            const r2: any = await axios.get(`/api/v1/chat/dialogue/live?con_uid=${convUid}`);
+            const d2 = r2?.data?.data || r2?.data;
+            if (!d2?.running) {
+              // 请求结束：停止轮询，重新加载最终历史
+              stopLivePolling();
+              liveViewIdRef.current = null;
+              setConvRunning(false);
+              loadConversation(convUid);
+            } else if (liveViewIdRef.current) {
+              renderLiveSteps(liveViewIdRef.current, d2.steps || []);
+            }
+          } catch (_e) {
+            /* 轮询失败忽略，下一轮再试 */
+          }
+        }, 2500);
+      } else {
+        setConvRunning(false);
+      }
+    } catch (_e) {
+      /* 接口失败忽略 */
+    }
+  };
+
   const loadConversation = async (convUid: string) => {
-    if (historyLoading) return;
+    const seq = ++loadSeqRef.current; // 记录本次请求序号，防旧响应覆盖新切换
     setHistoryLoading(true);
+    // 切换到该会话：即使历史为空也 setConversationId，确保 URL 变化时一定切换
+    // （之前 `if (msgList.length > 0)` 会导致"中断/空历史的对话点不进去"）
+    setConversationId(convUid);
     try {
       const res: any = await axios.get(`/api/v1/chat/dialogue/messages/history?con_uid=${convUid}`);
+      // 若期间又点了别的对话（更新请求），丢弃本次过期响应
+      if (seq !== loadSeqRef.current) return;
       let msgList: any[] | null = null;
       if (res?.success && Array.isArray(res.data)) {
         msgList = res.data;
@@ -2269,7 +2487,6 @@ const Playground: NextPage = () => {
         msgList = res;
       }
       if (msgList && msgList.length > 0) {
-        setConversationId(convUid);
         restoreFromHistory(
           msgList.map((m: any) => ({
             role: m.role,
@@ -2278,12 +2495,21 @@ const Playground: NextPage = () => {
             model_name: m.model_name,
           })),
         );
+      } else {
+        // 历史为空（如请求中断未落库）：清空当前消息，显示空会话
+        setMessages([]);
+        setExecutionMap({});
+        setActiveMessageId(null);
+        setActiveViewMsgId(null);
+        setArtifacts([]);
+        setTaskPlan([]);
       }
     } catch (e) {
       console.error('Failed to load conversation', e);
       message.error('加载历史对话失败');
     } finally {
       setHistoryLoading(false);
+      checkLive(convUid); // 检查是否运行中：是则显示实时进度并轮询
     }
   };
 
@@ -2449,6 +2675,8 @@ const Playground: NextPage = () => {
                             setActiveViewMsgId(round.viewMsg.id);
                             setSelectedStepId(stepId);
                             setRightPanelCollapsed(false);
+                            // 点击步骤时切回 execution 视图，确保能立即看到该步骤的输出
+                            setRightPanelView('execution');
                             setExecutionMap(prev => ({
                               ...prev,
                               [round.viewMsg!.id!]: {
@@ -3042,8 +3270,8 @@ const Playground: NextPage = () => {
                                 shape='circle'
                                 icon={<ArrowUpOutlined />}
                                 onClick={() => handleStart()}
-                                disabled={(!query.trim() && !uploadedFile) || loading}
-                                loading={loading}
+                                disabled={(!query.trim() && !uploadedFile) || loading || convRunning}
+                                loading={loading || convRunning}
                                 className={`group/send relative overflow-hidden border-none shadow-lg flex-shrink-0 h-9 w-9 transition-all duration-200 ${
                                   query.trim() || uploadedFile
                                     ? 'bg-gradient-to-br from-[#3b82f6] to-[#2563eb] hover:shadow-blue-300/40 hover:shadow-xl hover:scale-105'
@@ -3898,8 +4126,8 @@ const Playground: NextPage = () => {
                             size='large'
                             icon={<ArrowUpOutlined />}
                             onClick={() => handleStart()}
-                            disabled={(!query.trim() && !uploadedFile) || loading}
-                            loading={loading}
+                            disabled={(!query.trim() && !uploadedFile) || loading || convRunning}
+                            loading={loading || convRunning}
                             className={`group/send relative overflow-hidden border-none shadow-lg transition-all duration-200 ${
                               query.trim() || uploadedFile
                                 ? 'bg-gradient-to-br from-[#3b82f6] to-[#2563eb] hover:shadow-blue-300/40 hover:shadow-xl hover:scale-105'

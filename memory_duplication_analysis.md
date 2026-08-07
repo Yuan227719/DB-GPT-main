@@ -470,7 +470,175 @@ GUID生成规则/测试JSON结构/指标），压缩后注入 system prompt（`_
 
 ---
 
-## 9. 相关代码位置索引
+## 9. 方案总览与表路由优化
+
+### 9.1 全部方案状态总览
+
+| 方案 | 状态 | 说明 |
+|------|------|------|
+| 改动点 1：build() 后 clear memory | ✅ 已实施 | memory_list 仅本轮，避免历史重复 |
+| 改动点 3：view 修复 | ✅ 已实施 | historical_dialogues 含 AI 回复（提取 final_content）+ base_agent role 兜底 |
+| 改动点 4：task_progress 渲染 | ✅ 已实施 | workflow_prompt 加 jinja2 块 + `_task_progress` 类属性 bug 修复 |
+| buffer_size 5→10 | ✅ 已实施 | ShortTermMemory 保留最近 10 步 |
+| 紧凑表清单（OpenMetadata REST） | ✅ 已实施 | 30 表全量描述，conv_id 缓存 + TTL 30min |
+| 业务术语与口径注入 | ✅ 已实施 | 13 术语全量（数仓分层/字段命名/指标等） |
+| `get_table_schema` 工具 | ✅ 已实施 | OpenMetadata `get_entity_details` / Kyuubi 兜底 |
+| `get_glossary_term` 工具 | ✅ 已实施 | 按需查术语（errorcode/测项/指标含义），鲁棒匹配（错误码/CJK n-gram） |
+| 自动发现 OpenMetadata connector | ✅ 已实施 | 从 connector_instance 读 + 直接解密 token（绕过重水合 bug） |
+| 缓存 TTL | ✅ 已实施 | 表清单 + 术语均带 TTL（默认 30min，可配） |
+| 技能精简 | ✅ 已实施 | 去掉 walmart-sales-analyzer / financial-report-analyzer（10→8） |
+| 改动点 2：fragment id 加固 | ⏳ 待确认 | 可选双保险（agent 层过滤，不依赖 clear()） |
+| 方案 1：跨 schema 字典表纳入清单 | ⏳ 待确认 | 用户指出术语即来自这些表，已用 `get_glossary_term` 部分替代；是否还需纳入待定 |
+| 方案 2：业务查询模式知识库 | ⏳ 待确认 | 20 场景→表→SQL 模板，knowledge_retrieve |
+| 方案 3：术语库扩充 | ⏳ 待确认 | ErrorCode 分类/测项/指标枚举 |
+| 方案 4：血缘工具 get_table_lineage | ⏳ 待确认 | 覆盖场景 20（表上下游） |
+| 方案 5：探索引导 prompt | ⏳ 待确认 | 复杂问题先 get_table_schema/查字典，避免盲目 sql_query |
+| **方案 6：表路由优化** | 🆕 新增 | 见 9.2 |
+| **方案 7：经验闭环（自我进化）** | 🆕 新增 | 见 9.3 |
+
+### 9.2 新增方案 6：表路由优化
+
+**根因**：紧凑清单给 agent 的是"表名 + 描述"，但**没有"什么问题该去哪张表"的映射**。
+agent 面对"本周各项目良率"不知道良率在 `dws_indicator_w`，只能反复 sql_query / 查 info_schema → 慢且不准（实测场景 1 探索 11 次）。
+
+**方案选项**：
+
+| 选项 | 做法 | 成本 | 效果 |
+|------|------|------|------|
+| **A. 每表加"适用场景"提示** | 紧凑清单每张表后加一行路由提示，如 `适用: 良率/坏块比率/批次波动` | 轻（改 catalog 格式化 + 路由映射） | 高，agent 一眼定位 |
+| **B. 问题路由知识库** | 建"20+ 场景→目标表+SQL 模板"KB，agent 用 `knowledge_retrieve` 先查路由 | 中（需建 KB 内容） | 高，覆盖复杂问题，不占 prompt |
+| **C. find_table 路由工具** | 新增 `find_table(question)`，agent 先调用确定目标表 | 中 | 中，依赖 agent 记得调用 |
+| **D. A + B 组合** | 每表路由提示（快）+ 场景 KB（全） | 中 | 最高 |
+
+**建议**：先做 **A**（改动小、立竿见影），再按需做 **B**。
+
+**路由提示来源**：
+- 手动维护（20 场景→表映射，见 §8.2）
+- 或从表描述/OpenMetadata 标签推导（自动）
+- **或由方案 7（经验闭环）自动沉淀**（见 9.3）
+
+### 9.3 新增方案 7：经验闭环（自我进化）
+
+**核心思想**：沉淀历史对话记忆，从成功/失败路径中总结"最优路径"，让 agent 用上自己的经验。
+
+**经验四循环**：`采集 → 沉淀 → 应用 → 反馈 →（回到采集）`
+
+**① 采集层（记录每次交互）**——每个请求完成时落一条经验记录：
+```
+- 问题文本（+ embedding 向量）
+- 走过的路径：用了哪些表、哪些 SQL、调用顺序
+- 结果：是否成功（correctness_check/verify）、耗时、执行结果
+- 用户反馈（点赞/点踩，如有）
+```
+存储：单独表（如 `agent_experience`）或复用 gpts_messages + 额外字段。
+
+**② 沉淀层（LLM 提炼，离线/周期）**——定期用 LLM 分析经验记录，产出：
+```
+- 问题类型 → 目标表 映射（"良率问题→dws_indicator_w"）
+- 问题类型 → SQL 模板（"上周各项目良率 → SELECT ... FROM dws_indicator_w ..."）
+- 失败模式（"FL412E 常见错误：用错 schema、重复查 public"）
+```
+
+**③ 应用层（运行时用上经验）**——由浅入深三种：
+```
+L1. 沉淀成静态内容：更新每表"适用场景"提示（方案 6A）+ 业务查询 KB（方案 2）→ 无需检索
+L2. 运行时检索：新问题 → embedding 相似度检索历史成功路径 → 注入 prompt 作参考
+L3. 动态路由：检索到相似历史 → 直接建议目标表，约束探索空间
+```
+
+**④ 反馈层（验证与迭代）**：
+- 成功信号：agent 的 correctness_check / verify 结果
+- 强信号：用户点赞/点踩
+- 失败也记录：避免重复同样的错
+
+**与现有方案的关系（关键）**：经验闭环是 **方案 2（KB）和方案 6A（路由提示）的自动化内容来源**——
+原方案靠人工写 20 场景，经验闭环让 LLM 从历史对话自动提炼。
+
+**MVP 落地路径**：
+1. 先记录：请求完成时落 `(问题, 用过的表, SQL, 成功/失败, 耗时)`
+2. 再沉淀：离线脚本用 LLM 扫 N 条成功记录 → 产出 `问题类型→表→SQL模板` 追加进 KB
+3. 后用上：新问题时 `knowledge_retrieve` 命中经验 → 直接套用，不再瞎探索
+
+**注意点**：
+- 数据量门槛：需积累足够样本才有统计意义（可先手动 seed 20 场景）
+- 避免过拟合：经验要模板化，不写死具体值
+- 正确性把关：经验入库前要验证（correctness_check），坏经验会放大错误
+
+---
+
+## 10. 运行时问题与新发现
+
+> 日期 2026-08-04。实际使用中暴露的问题，与方案 5/6 相关的待修项。
+
+### 10.1 LLM 服务不稳定（模型端点过载）
+
+现象：`aicode.longsys.com` 的 Deepseek-V4-Flash 间歇性返回 500：
+
+```
+code 8: waitlist is full            ← 队列满
+code 5: Failed to forward request   ← 网关转发失败（上游不可用/超时）
+```
+
+- **非代码 bug，是模型服务容量/稳定性问题**
+- 影响：agent 某些轮 LLM 调用失败 → 请求中断/只返回部分输出
+- 建议：换稳定端点/模型，或等服务恢复；代码层加"服务错误识别 + 增强重试"缓解
+
+### 10.2 ReAct 退化循环（重复同一动作）
+
+现象：复杂问题（如 FL412E 良率）中，agent 反复执行**相同的 sql_query**
+（`SELECT table_name FROM information_schema.tables WHERE table_schema='public'` 实测 40 次），
+空结果 → verify 失败 → 重试 → 重复同一动作 → 直到 30 次上限/超时。
+
+根因：
+1. 模型不读紧凑清单，非要用 information_schema 重新探索，且用了错误 schema（`public` 而非 `st_embed`）
+2. **无防重复机制**——相同 (action, action_input) 可无限重试
+
+修法：
+- **A. prompt 强化**：明确"表清单已在提示词中，禁止 information_schema/SHOW TABLES 重新探索；schema 是 st_embed；不要重复同一查询，空结果换表或直接回答"
+- **B. 代码防循环**：记录最近 N 次 (action, action_input)，连续 3 次相同且无进展 → 注入干预消息
+
+### 10.3 ReAct 解析失败（"No correct response found"）
+
+现象：LLM 输出格式错乱时，前端显示 `No correct response found...`。
+
+机制（`react_parser.py:505`）：解析器取 `Action:` 到 `Action Input:` 之间的文本为 action；
+LLM 若把 Thought 叙述混进 Action 区、或根本没有干净的 `Action: X\nAction Input: {...}` 对
+（如输出 `Let me check ...SQL._query": "SELECT...` + 一个 todos JSON），则 `parse_current_step`
+返回空 → `ReActAgent.act()`（`react_agent.py:249`）返回 "No correct response found"。
+
+根因：
+1. 模型在复杂任务 + 服务不稳定下生成格式错乱的回复
+2. **解析器零容错**——格式不干净就整体拒绝
+
+修法：
+- **解析器容错**：从坏输出恢复（检测到 `"sql": "..."` / `"todos": [...]` 就还原为对应工具）
+- **重试提示更具体**：告诉 LLM"上轮缺 Action 行/JSON 残缺，请严格输出 Action 和 Action Input"
+- **服务错误识别**：检测 500/waitlist/forward 错误 → 报"模型服务繁忙"，而非"格式不正确"
+
+### 10.4 思考过程显示缺失（已修复）
+
+现象：前端"思考中"卡片为空，只看到工具调用，看不到 AI 推理。
+
+根因：`thinking_chunk` handler 把思考文本存进 `pending_thoughts` 并创建"思考中"步骤，
+但**从未把文本作为 step.chunk 推给前端**（`agentic_data_api.py:4818`）。
+
+修复：`thinking_chunk` 时 `yield step_chunk(step_id, "text", clean_chunk)`，让"思考中"卡片
+显示流式推理。✅ 已实施（编译通过，待模型恢复后前端验证）。
+
+### 10.5 待实现修复清单（运行时体验）
+
+| 修复 | 状态 | 解决 |
+|------|------|------|
+| 服务错误识别（500/waitlist/forward → 清晰提示） | ⏳ 待做 | 10.1/10.3 |
+| 增强重试（指数退避 5-8 次，替代固定 3 次/10s） | ⏳ 待做 | 10.1 |
+| 防重复循环（连续相同动作注入干预） | ⏳ 待做 | 10.2 |
+| prompt 探索引导（禁 information_schema、schema=st_embed、不重复查询） | ⏳ 待做 | 10.2 |
+| 解析器容错 + 重试提示更具体 | ⏳ 待做 | 10.3 |
+| 思考过程流式显示 | ✅ 已实施 | 10.4 |
+
+---
+
+## 11. 相关代码位置索引
 
 | 位置 | 作用 |
 |------|------|

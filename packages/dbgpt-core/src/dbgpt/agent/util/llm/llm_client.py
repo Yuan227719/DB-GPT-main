@@ -269,7 +269,10 @@ class AIWrapper:
                         )
             if not model_output:
                 raise ValueError("LLM generate stream is null!")
-            parsed_output = model_output.gen_text_with_thinking()
+            # 思考模式下，gen_text_with_thinking() 会把 reasoning_content（思考）和
+            # content（实际输出）拼接返回，会污染 ReAct 解析（思考里常有 Action/Thought 字样）。
+            # 这里只返回纯 content（ReAct 文本/最终答案），思考经流式 delta_thinking 展示。
+            parsed_output = model_output.text or model_output.gen_text_with_thinking()
 
             if verbose:
                 print("\n", "-" * 80, flush=True, sep="")

@@ -204,15 +204,21 @@ class ConnectorService(
                     connector["encrypted_credentials"],
                     connector["encryption_salt"],
                 )
-                loop.run_until_complete(
-                    connector_manager.create_connector(
-                        connector_type=connector["connector_type"],
-                        credentials=credentials,
-                        name=connector["display_name"],
-                        extra_config=connector.get("config"),
-                        connector_id=connector["connector_id"],
-                    )
+                create_coro = connector_manager.create_connector(
+                    connector_type=connector["connector_type"],
+                    credentials=credentials,
+                    name=connector["display_name"],
+                    extra_config=connector.get("config"),
+                    connector_id=connector["connector_id"],
                 )
+                if loop.is_running():
+                    # 事件循环已运行（uvicorn 场景）：不能 run_until_complete，
+                    # 否则抛 "this event loop is already running"，导致 connector
+                    # 重水合失败、工具/术语/表描述全不可用。改用 ensure_future
+                    # 在当前循环里异步创建。
+                    asyncio.ensure_future(create_coro)
+                else:
+                    loop.run_until_complete(create_coro)
             except ValueError as exc:
                 # Catalog downgrade compatibility: pre-1.5 instances may lack
                 # server_uri in config_json. Mark them as needs_reactivation so

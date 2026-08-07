@@ -480,7 +480,61 @@ async def test_get_table_schema_tool():
 
 
 # ─────────────────────────────────────────────────────────────
-# 7. 缓存 TTL：OpenMetadata 更新后自动过期重拉（复用 agentic_data_api._is_cache_fresh）
+# 7. ReAct 解析容错：纯文本最终答案当作 terminate 接受
+# ─────────────────────────────────────────────────────────────
+async def test_react_parser_fallback():
+    print("\n== 7. ReAct 解析容错：纯文本最终答案 ==")
+    from dbgpt.agent.expand.react_agent import ReActAgent
+    from dbgpt.agent import ProfileConfig
+
+    class _RA(ReActAgent):
+        profile: ProfileConfig = ProfileConfig(name="t", role="helper")
+
+    agent = _RA()
+    # 纯文本最终答案（无 Action:）→ 当作 terminate 最终答案
+    out1 = await agent.act(
+        AgentMessage(content="我通过SQL查询分析了FL412E项目，整体良率约98.0%。"),
+        sender=None,
+    )
+    check("纯文本最终答案被接受为 terminate",
+          out1.is_exe_success and out1.terminate,
+          f"success={out1.is_exe_success} terminate={out1.terminate}")
+    # LLM 服务错误文本 → 不能被当成最终答案
+    out2 = await agent.act(
+        AgentMessage(content="**LLMServer Generate Error**: Error code: 500 - waitlist is full"),
+        sender=None,
+    )
+    check("LLM 服务错误文本被拒绝",
+          not out2.is_exe_success and "No correct response" in out2.content,
+          f"success={out2.is_exe_success}")
+
+    # markdown 加粗标签（**Action:**）→ 归一化后能解析
+    from dbgpt.agent.util.react_parser import ReActOutputParser
+
+    _p = ReActOutputParser()
+    _bold = "**Thought:** 查表\n**Action:** sql_query\n**Action Input:** {\"sql\": \"SELECT 1\"}"
+    _steps = _p.parse_current_step(_bold)
+    check("加粗标签归一化后能解析",
+          len(_steps) == 1 and _steps[0].action == "sql_query",
+          f"steps={len(_steps)}")
+    # 反引号包裹的 Action/Input（`Action: \`sql_query\``）→ 归一化后能解析
+    _bt = "Thought: 查表\nAction: `sql_query`\nAction Input: `{\"sql\": \"SELECT 1\"}`"
+    _steps_bt = _p.parse_current_step(_bt)
+    check("反引号标签归一化后能解析",
+          len(_steps_bt) == 1
+          and _steps_bt[0].action == "sql_query"
+          and _steps_bt[0].action_input == {"sql": "SELECT 1"},
+          f"action={getattr(_steps_bt[0], 'action', None) if _steps_bt else None}")
+    # 无 Thought 但有 Action（模型省略 Thought）→ 兜底解析
+    _no_thought = "我需要执行查询。\nAction: sql_query\nAction Input: {\"sql\": \"SELECT 1\"}"
+    _steps_nt = _p.parse_current_step(_no_thought)
+    check("无 Thought 但有 Action 能解析",
+          len(_steps_nt) == 1 and _steps_nt[0].action == "sql_query",
+          f"steps={len(_steps_nt)}")
+
+
+# ─────────────────────────────────────────────────────────────
+# 8. 缓存 TTL：OpenMetadata 更新后自动过期重拉（复用 agentic_data_api._is_cache_fresh）
 # ─────────────────────────────────────────────────────────────
 def test_cache_ttl():
     print("\n== 7. 缓存 TTL：过期自动重拉 ==")
@@ -511,6 +565,7 @@ async def main():
     await test_task_progress_render()
     await test_openmetadata_client()
     await test_get_table_schema_tool()
+    await test_react_parser_fallback()
     test_cache_ttl()
     print(f"\n=== 结果: PASS={PASS} FAIL={FAIL} ===")
     raise SystemExit(1 if FAIL else 0)

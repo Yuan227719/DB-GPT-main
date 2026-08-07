@@ -89,6 +89,16 @@ from .role import AgentRunMode, Role  # 角色与运行模式
 
 logger = logging.getLogger(__name__)  # 模块级日志器
 
+# 运行中对话的实时步骤记录：conv_id -> {"steps": [...], "updated_at": ts}
+# 供前端轮询"运行中"对话的实时进度（refresh 后仍能查看）。
+# 由 API 层（_react_agent_stream）写入，结束清理。
+_LIVE_AGENT_STEPS: Dict[str, Dict[str, Any]] = {}
+
+
+def get_live_agent_steps(conv_id: str) -> Optional[Dict[str, Any]]:
+    """返回某会话的实时运行状态（供 API 层暴露）。"""
+    return _LIVE_AGENT_STEPS.get(conv_id)
+
 
 class ConversableAgent(Role, Agent):
     """可对话 Agent 的基类，所有具体 Agent（如 ReActAgent）均继承自此类。
@@ -770,6 +780,12 @@ class ConversableAgent(Role, Agent):
             start_time = time.time()  # 记录开始时间
             is_success = True  # 是否成功
             observation = received_message.content or ""  # 初始 observation 为接收消息内容
+            # 防循环：记录 (action, action_input) 出现次数，连续相同动作达阈值时注入干预
+            action_history: Dict[Tuple[str, str], int] = {}
+            _LOOP_WARN_THRESHOLD = 3
+            # 是否已真正执行过数据查询（sql_query/code_interpreter/shell_interpreter）：
+            # 用于防止模型只看了 schema 就过早 terminate
+            _executed_data_query = False
             # 重试循环：最多 max_retry_count 次
             while current_retry_counter < self.max_retry_count:
                 if current_retry_counter > 0:
@@ -993,10 +1009,96 @@ class ConversableAgent(Role, Agent):
                         check_pass=check_pass,
                         current_retry_counter=current_retry_counter,
                     )
+                    # 记录是否执行过数据查询（用于防过早 terminate）
+                    _act_name = getattr(act_out, "action", None) or ""
+                    if _act_name in ("sql_query", "code_interpreter", "shell_interpreter"):
+                        _executed_data_query = True
                     # 非循环模式或动作终止时退出
                     if self.run_mode != AgentRunMode.LOOP or act_out.terminate:
-                        logger.debug(f"Agent {self.name} reply success!{reply_message}")
-                        break
+                        # 防过早终止：模型常只看了表结构（get_table_schema）就 terminate，
+                        # 或遇"表不存在"等错误就放弃。若轮次很少、从未真正查询数据、且
+                        # 终止内容不像"反问澄清"也不像有数据的实质回答，则注入提示继续，
+                        # 而不是直接结束。
+                        _terminate_text = (act_out.content or "")[:300]
+                        _is_clarify = any(
+                            k in _terminate_text
+                            for k in (
+                                "请提供", "请确认", "请告知", "请给出", "请指定",
+                                "please provide", "please confirm", "请说明",
+                                "请告诉我具体的", "请输入",
+                            )
+                        )
+                        # 模型终止内容像是在描述"报错/要修正重查/失败"（而非给出答案）
+                        _is_err_retry = any(
+                            k in _terminate_text
+                            for k in (
+                                "重新查询", "重新", "修正", "有误", "报错", "执行失败",
+                                "表不存在", "failed", "error", "exception",
+                                "OperationalError", "TypeError", "语法错误", "类型",
+                            )
+                        )
+                        # 模型终止内容像是"探索式规划"（说要做但还没做，如"让我先查询/先看看"），
+                        # 而非真正给出答案 —— 这类也是过早终止。
+                        # 特别地，模型常"宣布要生成 HTML 报告/重新执行查询"后就结束，
+                        # 但没有真正调用 code_interpreter / html_interpreter。
+                        _is_planning = any(
+                            k in _terminate_text
+                            for k in (
+                                "让我先", "我先", "首先", "需要了解", "需要先", "先看看",
+                                "先查询", "先查", "查询一下", "了解一下", "探索", "让我来",
+                                "我先看看", "先探索",
+                                # 宣布要做但没执行
+                                "让我生成", "我会生成", "现在生成", "生成HTML", "生成html",
+                                "生成报告", "生成一份", "开始生成", "生成最终",
+                                "让我重新", "我重新", "重新执行", "让我修正", "让我修复",
+                                "让我再用", "让我换", "让我尝试",
+                                "现在查询", "现在去", "接下来", "下一步", "让我继续",
+                                "我现在要", "接下来我", "继续查询", "继续分析",
+                                "现在使用", "已生成", "渲染报告", "HTML 报告", "html报告",
+                                "报告已生成", "报告生成", "让我渲染", "进行渲染",
+                            )
+                        )
+                        _rounds = current_retry_counter + 1
+                        if (
+                            not _is_clarify
+                            and (
+                                (not _executed_data_query and (_rounds <= 3 or _is_planning))
+                                or (_rounds <= 6 and (_is_err_retry or _is_planning))
+                            )
+                        ):
+                            logger.warning(
+                                f"Agent {self.name} premature terminate at round "
+                                f"{_rounds} (no-query={not _executed_data_query}, "
+                                f"err={_is_err_retry}, plan={_is_planning}): "
+                                f"{_terminate_text[:60]}"
+                            )
+                            observation = (
+                                "⚠️ 你的回答还缺少实际数据分析就结束了。"
+                                "请先通过 sql_query / code_interpreter 获取并分析真实数据，"
+                                "修正遇到的报错后重试，最后用 terminate 返回完整总结 "
+                                '{"result": "..."}。'
+                            )
+                        else:
+                            logger.debug(f"Agent {self.name} reply success!{reply_message}")
+                            break
+                # 防循环：检测连续重复的 (action, action_input)，达阈值时注入干预消息
+                try:
+                    _act_name = getattr(act_out, "action", None) or ""
+                    _act_input = getattr(act_out, "action_input", None) or ""
+                    if _act_name:
+                        _key = (str(_act_name), str(_act_input))
+                        action_history[_key] = action_history.get(_key, 0) + 1
+                        if action_history[_key] >= _LOOP_WARN_THRESHOLD:
+                            _warn = (
+                                "⚠️ 你已连续 %d 次执行相同操作（%s）且未获得有用结果。"
+                                "请立即停止该操作，换用其他表/查询方式，"
+                                "或直接基于已有信息给出最终答案。"
+                            ) % (action_history[_key], _act_name)
+                            observation = f"{_warn}\n{observation}"
+                            logger.warning(_warn)
+                            action_history[_key] = 0  # 重置，避免警告无限叠加
+                except Exception:
+                    logger.debug("loop detection skipped", exc_info=True)
                 # 检查超时
                 time_cost = time.time() - start_time
                 if time_cost > self.max_timeout:

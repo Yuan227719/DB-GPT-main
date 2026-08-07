@@ -1,3 +1,4 @@
+import os
 from typing import TYPE_CHECKING, Dict, Optional, Type, TypeVar
 
 import dbgpt_serve.datasource.serve
@@ -90,9 +91,21 @@ def register_serve_apps(
         global_api_keys = ",".join(app_config.system.api_keys)
         system_app.config.set("dbgpt.app.global.api_keys", global_api_keys)
     if app_config.system.encrypt_key:
-        system_app.config.set(
-            "dbgpt.app.global.encrypt_key", app_config.system.encrypt_key
-        )
+        # 同时写入 ENCRYPT_KEY 环境变量：CredentialStore 读取该变量作为兜底，
+        # 否则 uvicorn 场景下 dotted config key 可能未在其创建前设置，导致退化用
+        # 每次重启都变的随机密钥，已存 connector 凭证跨重启无法解密 → REST 401。
+        os.environ["ENCRYPT_KEY"] = app_config.system.encrypt_key
+        try:
+            system_app.config.set(
+                "dbgpt.app.global.encrypt_key", app_config.system.encrypt_key
+            )
+        except KeyError:
+            # 已存在则覆盖，确保 CredentialStore 拿到稳定密钥
+            system_app.config.set(
+                "dbgpt.app.global.encrypt_key",
+                app_config.system.encrypt_key,
+                overwrite=True,
+            )
 
     # ################################ Prompt Serve Register Begin ####################
     from dbgpt_serve.prompt.serve import (

@@ -199,6 +199,37 @@ class ReActOutputParser:
         if "[TOOL_CALL]" in text:
             text = self._convert_tool_call_block(text)
 
+        # --- Form 4: DSML（<｜DSML｜tool_calls> / <｜DSML｜invoke ...>）--------
+        # DeepSeek 等模型偶尔输出 Anthropic 风格 DSML 而非 ReAct，如：
+        #   <｜DSML｜tool_calls>
+        #   <｜DSML｜invoke name="get_table_schema">
+        #   <｜DSML｜parameter name="table_name" string="true">dim_base_wo_di</｜DSML｜parameter>
+        #   </｜DSML｜invoke>
+        #   </｜DSML｜tool_calls>
+        # 归一化为标准 <invoke>/<parameter> 后复用 _convert_invoke_block。
+        if "｜DSML｜" in text or "＜DSML＞" in text or "<DSML>" in text:
+            text = self._strip_dsml_tool_call(text)
+
+        return text
+
+    def _strip_dsml_tool_call(self, text: str) -> str:
+        """把 DSML 工具调用块转成标准 ReAct（复用 <invoke> 转换）。
+
+        DSML 用全角竖线包裹标签（<｜DSML｜...｜>），且参数带 string="true" 等
+        属性。先把属性剥掉、标签归一化成 <invoke>/<parameter>，再去掉
+        <tool_calls> 包装，最后复用 _convert_invoke_block。
+        """
+        # 1) 剥掉参数属性（string="true" 等），只留 name
+        text = re.sub(r'\s+string="[^"]*"', "", text)
+        # 2) 归一化全角竖线标签：<｜DSML｜xxx  → <xxx；xxx｜> → xxx>
+        text = text.replace("｜DSML｜", "").replace("｜", "")
+        # 3) 去掉 <tool_calls> / </tool_calls> 包装
+        text = re.sub(r"<\s*tool_calls\s*>\s*</\s*tool_calls\s*>", "", text)
+        text = re.sub(r"<\s*tool_calls\s*>", "", text)
+        text = re.sub(r"</\s*tool_calls\s*>", "", text)
+        # 4) 复用 <invoke>/<parameter> 转换
+        if "<invoke" in text or "<invoke>" in text:
+            text = self._convert_invoke_block(text)
         return text
 
     @staticmethod
@@ -378,7 +409,16 @@ class ReActOutputParser:
         thought_matches = self._find_prefix_matches(text, self.thought_prefix_escaped)
 
         if not thought_matches:
-            return []
+            # 模型（尤其思考模式）可能省略 "Thought:"，只输出叙述 + Action。
+            # 此时若存在 Action: 或 Action Input:，仍尝试把整段解析为一个 step，
+            # 避免误报解析失败（缺 Action: 时由 _parse_step 按参数结构推断工具）。
+            if re.search(rf"{self.action_prefix_escaped}", text) or re.search(
+                rf"{self.action_input_prefix_escaped}", text
+            ):
+                step = self._parse_step(text)
+                if step:
+                    steps.append(step)
+            return steps
 
         # Process each thought section
         for i, match in enumerate(thought_matches):
@@ -408,6 +448,19 @@ class ReActOutputParser:
         to run tools should use only the first actionable step while preserving
         ``parse()`` for history and diagnostics.
         """
+        # 归一化 markdown 加粗标签：**Action:** → Action:，否则解析失败
+        text = re.sub(
+            r"\*\*(Thought|Action|Action Input|Observation|Phase|Action Intention|Action Reason)\s*[:：]\s*\*\*",
+            r"\1: ",
+            text or "",
+        )
+        # 归一化反引号包裹的标签值：Action: `sql_query` → Action: sql_query，
+        # Action Input: `{...}` → Action Input: {...}（否则工具名/JSON 带反引号解析失败）
+        text = re.sub(
+            r"(?:\*\*)?(?:Thought|Action|Action Input|Observation|Phase|Action Intention|Action Reason)\s*[:：]\s*`([^`]*)`",
+            lambda m: f"{m.group(0).split('`')[0]} {m.group(1)}",
+            text or "",
+        )
         steps = self.parse(text)
         if len(steps) <= 1:
             return steps
@@ -514,8 +567,12 @@ class ReActOutputParser:
             is_terminal = action.lower() == self.terminate_action.lower()
 
         # Extract action input
+        # 关键：也要在下一个 "Action:" 行停住。模型偶尔会在一次响应里输出多个
+        # Action（如同时查两个术语），若不停在 Action: 会把后续所有 Action/Input
+        # 整块吞进第一个 action_input，导致工具参数变成垃圾（如 term_name 变成
+        # 一整串 "{...}\nAction: ...\nAction Input: ..."）。
         action_input_match = re.search(
-            rf"{action_input_line}(.*?)(?={observation_line}|{thought_line}|\Z)",
+            rf"{action_input_line}(.*?)(?={observation_line}|{thought_line}|{action_line}|\Z)",
             match_text,
             re.DOTALL | re.MULTILINE,
         )
@@ -536,6 +593,28 @@ class ReActOutputParser:
                     action_input = action_input_text
             else:
                 action_input = action_input_text
+
+        # 模型偶尔会漏掉 "Action: <tool>" 行（只输出 Action Input）。此时根据
+        # action_input 的参数结构推断工具名，避免 agent 拿到 action=None 而中断。
+        if not action and isinstance(action_input, dict):
+            _infer_keys = {
+                "get_table_schema": "table_name",
+                "get_glossary_term": "term_name",
+                "sql_query": "sql",
+                "code_interpreter": "code",
+                "shell_interpreter": "code",
+                "todowrite": "todos",
+                "terminate": "result",
+                "load_skill": "skill_name",
+                "execute_skill_script_file": "script_file_name",
+                "knowledge_retrieve": "query",
+                "html_interpreter": "html",
+            }
+            for _tool, _key in _infer_keys.items():
+                if _key in action_input:
+                    action = _tool
+                    is_terminal = _tool == "terminate"
+                    break
 
         # Extract observation
         observation_match = re.search(

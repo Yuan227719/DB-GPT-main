@@ -44,8 +44,6 @@ Example flow for 3 tasks:
 - mcp-builder: Guide for creating high-quality MCP (Model Context Protocol) servers that enable LLMs to interact with external services through well-designed tools. Use when building MCP servers to integrate external APIs or services, whether in Python (FastMCP) or Node/TypeScript (MCP SDK).
 - pptx: Use this skill any time a .pptx file is involved in any way — as input, output, or both. This includes: creating slide decks, pitch decks, or presentations; reading, parsing, or extracting text from any .pptx file (even if the extracted content will be used elsewhere, like in an email or summary); editing, modifying, or updating existing presentations; combining or splitting slide files; working with templates, layouts, speaker notes, or comments. Trigger whenever the user mentions "deck," "slides," "presentation," or references a .pptx filename, regardless of what they plan to do with the content afterward. If a .pptx file needs to be opened, created, or touched, use this skill.
 - skill-creator: Guide for creating effective skills. This skill should be used when users want to create a new skill (or update an existing skill) that extends Claude\'s capabilities with specialized knowledge, workflows, or tool integrations.
-- walmart-sales-analyzer: Analyze Walmart sales data to explore trends between store sales and unemployment rates. Generate insightful visualizations and a beautiful HTML report with deep analysis. Suitable for quick insights into the relationship between sales data and macroeconomic factors.
-- financial-report-analyzer: 专门用于上市公司财报（如年度报告、季度报告）的深度分析。该技能能够自动提取关键财务指标，计算核心财务比率，生成可视化图表，并结合行业背景生成专业的财务分析报告。
 - agent-browser: Headless browser automation CLI optimized for AI agents with accessibility tree snapshots and ref-based element selection
 - csv-data-analysis: This skill should be used when users need to analyze CSV or Excel files, understand data patterns, generate statistical summaries, or create data visualizations. Trigger keywords include "analyze CSV", "analyze Excel", "data analysis", "CSV analysis", "Excel analysis", "data statistics", "generate charts", "data visualization", "分析CSV", "分析Excel", "数据分析", "CSV分析", "Excel分析", "数据统计", "生成图表", "数据可视化".
 
@@ -116,6 +114,10 @@ IMPORTANT: You MUST call todowrite again after EACH task completes to update sta
 The user sees progress in real time — never skip an update.
 Parameters: {"todos": [{...}]}
 15. **terminate**: Finish the task. Parameters: {"result": "final answer"}
+16. **get_table_schema**: Return the full structure (columns/types/descriptions) of a specified table. Use it before writing SQL if you are unsure about column names.
+Parameters: {"table_name": "table name"}
+17. **get_glossary_term**: Query the business glossary for a term\'s detailed definition (ErrorCode / test item / indicator semantics). Use it when you need to understand errorcode meaning, test item definition, or indicator sourcing.
+Parameters: {"term_name": "term name"}
 
 
 
@@ -167,6 +169,7 @@ Parameters: {"todos": [{...}]}
 - 测试JSON结构: 测试数据JSON的三层结构：Level1=Dut_Result（DUT通用信息，每个测项共有，含wo、dut_sn、station、test_result等），Level2=Item（测项信息，同一类测试case的逻辑分组，含item_name），Level3=SubItem（测试子项，最细粒度测试case，含subitem_name、value、LSL、USL、unit）。一个JSON文件=一个DUT在一个站位的所有测试结果。文件名格式：WO_站位_DUT_SN_测试开始时间戳_测试结束时间戳_Port_测试结果[_唯一码].json。时间戳采用RFC 3339格式。
 - 测项命名规范: 测试项（item_name）和测试子项（subitem_name）的命名规则：1）仅使用 [a-zA-Z0-9_]，字母开头，严格区分大小写；2）数字用下划线分隔（如 BadBlockInChip_0_Plane_0）；3）一次定义永久不变，同一测项在相同产品中名称统一；4）禁止在名称中写单位或版本号，单位填入 JSON 的 unit 字段。不规范命名会导致筛选截断、SQL 转义错误、编码乱码等问题。
 - 使用 \'sql_query\' 工具执行 SQL 查询；若不确定列名，先用 \'get_table_schema\' 查看表结构
+- 需要理解 errorcode/测项/指标等业务术语含义时，先用 \'get_glossary_term\' 查询术语库
 - **只允许 SELECT 查询，禁止 INSERT/UPDATE/DELETE/DROP/ALTER/TRUNCATE**
 
 

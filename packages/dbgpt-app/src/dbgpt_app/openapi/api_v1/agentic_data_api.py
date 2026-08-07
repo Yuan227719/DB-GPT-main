@@ -1539,6 +1539,7 @@ async def _react_agent_stream(
     from dbgpt.agent.util.react_parser import ReActOutputParser
     from dbgpt.core import StorageConversation
     from dbgpt.model.cluster.client import DefaultLLMClient
+    from dbgpt.agent.core.base_agent import _LIVE_AGENT_STEPS
     from dbgpt.util.code.server import get_code_server
     from dbgpt_serve.agent.agents.db_gpts_memory import MetaDbGptsMessageMemory
     from dbgpt_serve.conversation.serve import Serve as ConversationServe
@@ -1550,6 +1551,25 @@ async def _react_agent_stream(
     if not isinstance(user_input, str):
         # 兜底类型转换
         user_input = str(user_input or "")
+
+    # 提前创建并持久化会话与 human 消息（在下方慢速的 skills/connectors 加载之前）：
+    # 否则运行中刷新页面时历史为空，用户刚发的提问会"消失"。
+    conv_id = dialogue.conv_uid or str(uuid.uuid4())
+    conv_serve = ConversationServe.get_instance(CFG.SYSTEM_APP)
+    storage_conv = StorageConversation(
+        conv_uid=conv_id,
+        chat_mode=dialogue.chat_mode or "chat_react_agent",
+        user_name=dialogue.user_name,
+        sys_code=dialogue.sys_code,
+        summary=dialogue.user_input,
+        app_code=dialogue.app_code,
+        conv_storage=conv_serve.conv_storage,
+        message_storage=conv_serve.message_storage,
+    )
+    storage_conv.save_to_storage()  # 保存会话（侧边栏可见）
+    storage_conv.start_new_round()  # 开启新一轮对话
+    storage_conv.add_user_message(user_input)  # 加入用户消息
+    storage_conv.save_to_storage()  # 立即落库 human 消息
 
     # 从 ext_info 解析各种上下文标识
     file_path = None  # 上传文件路径
@@ -1930,7 +1950,10 @@ async def _react_agent_stream(
 {glossary_section}
 - 使用 'sql_query' 工具执行 SQL 查询；若不确定列名，先用 'get_table_schema' 查看表结构
 - 需要理解 errorcode/测项/指标等业务术语含义时，先用 'get_glossary_term' 查询术语库
+- 当前数据库 schema 是 st_embed（查业务字典表才是 embed_db / masterdata_db）
+- 某查询返回空时，换用其他表或直接基于已有信息回答，禁止重复执行同一查询
 - **只允许 SELECT 查询，禁止 INSERT/UPDATE/DELETE/DROP/ALTER/TRUNCATE**
+- **SQL 必须用 Trino/Presto 语法**（底层是 Trino）：日期字面量用 `DATE '2026-07-27'`（不要用 `'2026-07-27'` 直接比 DATE 列）；字符串列转数值用 `CAST(x AS DOUBLE)`/`TRY_CAST`；百分比如 `'98.00%'` 用 `CAST(REPLACE(yield, '%', '') AS DOUBLE)` 转换；列名/别名若含保留字需加反引号
 """
             logger.info(
                 f"Loaded database connector: {database_name} "
@@ -3800,7 +3823,7 @@ print(json.dumps(summary, ensure_ascii=False))
     else:  # 用户未指定模型
         llm_config = LLMConfig(llm_client=llm_client)  # 用默认策略
 
-    conv_id = dialogue.conv_uid or str(uuid.uuid4())  # 取会话 ID 或新生成
+    # conv_id / conv_serve / storage_conv 已在生成器开头创建并持久化 human 消息
     react_state["conv_id"] = conv_id  # 写入会话状态
     # ─────────────────────────────────────────────────────────────
     # 【上下文注入点 #2：AgentMemory 创建】
@@ -3823,22 +3846,8 @@ print(json.dumps(summary, ensure_ascii=False))
     # AgentMemory 默认 memory=ShortTermMemory(buffer_size=5)
     agent_memory = AgentMemory(gpts_memory=gpt_memory)  # 组装成 AgentMemory
 
-    # --- Persist conversation to chat_history for sidebar display ---
-    # 把会话写入 chat_history 表，供前端侧边栏展示
-    conv_serve = ConversationServe.get_instance(CFG.SYSTEM_APP)  # 取 ConversationServe 实例
-    storage_conv = StorageConversation(  # 构造 StorageConversation 持久化对象
-        conv_uid=conv_id,
-        chat_mode=dialogue.chat_mode or "chat_react_agent",  # 默认 react_agent 模式
-        user_name=dialogue.user_name,
-        sys_code=dialogue.sys_code,
-        summary=dialogue.user_input,  # 用首条用户输入作为会话摘要
-        app_code=dialogue.app_code,
-        conv_storage=conv_serve.conv_storage,  # 会话存储
-        message_storage=conv_serve.message_storage,  # 消息存储
-    )
-    storage_conv.save_to_storage()  # 保存会话
-    storage_conv.start_new_round()  # 开启新一轮对话
-    storage_conv.add_user_message(user_input)  # 加入用户消息
+    # storage_conv 已在生成器开头创建并持久化 human 消息（此处复用，避免重复）
+    # （原 "Persist conversation" 块已上移到生成器开头，见函数前部）
     context = AgentContext(  # 构造 Agent 上下文（conv_id、语言、温度等）
         conv_id=conv_id,
         gpts_app_code="react_agent",
@@ -4445,6 +4454,14 @@ Action Reason: Why this action is needed now, plain text, MUST be concise and fi
 Do not use ellipsis.
 Action: The selected tool name
 Action Input: The JSON format of tool parameters
+
+## COMPLETION (MANDATORY)
+When the task is COMPLETE, you MUST NOT answer in plain text. Output EXACTLY:
+Thought: ...
+Action: terminate
+Action Input: {{"result": "final answer text"}}
+- The final answer text must go INSIDE the Action Input {{"result": "..."}}.
+- NEVER output the final answer as plain markdown outside Action Input.
 """.strip()
 
         tool_pack = ToolPack(  # 完整模式 ToolPack：列出全部工具
@@ -4505,45 +4522,19 @@ Action Input: The JSON format of tool parameters
                 _connector_lines = []  # 每行描述一个 connector
                 for _c in _selected:  # 遍历每个选中的 connector
                     _tool_lines = []  # 该 connector 下每个工具的描述
+                    # 极简注入：只列工具名 + 一行简短描述，不注入参数 schema。
+                    # 避免把 MCP 工具的完整参数定义灌进提示词导致膨胀（模型
+                    # 需要调用某工具时，自然会根据名字 + 描述构造 Action Input，
+                    # 无需把所有参数 schema 提前塞给模型）。
                     for t in _c.get("tools", []):  # 遍历 connector 的工具
                         _name = t.get("name", "unknown")  # 工具名
                         _desc = t.get("description", "") or "(no description)"  # 工具描述
-                        _args_schema = t.get("args", {}) or {}  # 参数 schema
-                        # Render args schema as concise Parameters description
-                        # 把参数 schema 渲染成简明的 Parameters 描述
-                        if _args_schema:
-                            _param_parts = []  # 每个参数的描述片段
-                            for _arg_name, _arg_meta in _args_schema.items():  # 遍历参数
-                                if isinstance(_arg_meta, dict):  # 参数元信息是 dict
-                                    _arg_type = _arg_meta.get("type", "any")  # 参数类型
-                                    _req = (  # 是否必填
-                                        "required"
-                                        if _arg_meta.get("required")
-                                        else "optional"
-                                    )
-                                    _arg_desc = _arg_meta.get("description", "")  # 参数描述
-                                    if _arg_desc:  # 有描述时拼接
-                                        _trimmed_desc = (  # 描述超 120 字截断
-                                            _arg_desc[:120] + "..."
-                                            if len(_arg_desc) > 120
-                                            else _arg_desc
-                                        )
-                                        _param_parts.append(
-                                            f'"{_arg_name}": <{_arg_type}, {_req}, '
-                                            f"{_trimmed_desc}>"
-                                        )
-                                    else:  # 无描述时只写类型和必填
-                                        _param_parts.append(
-                                            f'"{_arg_name}": <{_arg_type}, {_req}>'
-                                        )
-                                else:  # 参数元信息不是 dict，简化为 any
-                                    _param_parts.append(f'"{_arg_name}": <any>')
-                            _params_str = "{" + ", ".join(_param_parts) + "}"  # 拼成 JSON 风格字符串
-                        else:  # 无参数 schema
-                            _params_str = "{}"
-                        _tool_lines.append(  # 把工具描述拼成一行
-                            f"  - **{_name}**: {_desc}\n    Parameters: {_params_str}"
+                        _desc_line = (  # 描述超 100 字截断成一行
+                            _desc[:100] + "..."
+                            if len(_desc) > 100
+                            else _desc
                         )
+                        _tool_lines.append(f"  - **{_name}**: {_desc_line}")
                     _connector_lines.append(  # 把整个 connector 描述拼成一段
                         f"### {_c.get('name', 'unknown')} "
                         f"({_c.get('connector_type', 'unknown')})\n"
@@ -4699,6 +4690,22 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
     # 历史持久化：在流式过程中收集 step 数据
     history_steps: List[Dict[str, Any]] = []  # 全部 step 数据
     current_history_step: Optional[Dict[str, Any]] = None  # 当前正在处理的 step
+    # 实时运行状态：把 history_steps 注册为 live steps，供前端 refresh 后轮询。
+    # history_steps 是同一列表，append 的内容会立即出现在 live 接口。
+    _LIVE_AGENT_STEPS[conv_id] = {
+        "steps": history_steps,
+        "user_input": user_input,
+        "updated_at": time.time(),
+    }
+
+    def _append_or_replace_step(step_dict: Dict[str, Any]) -> None:
+        """写入 history_steps：若同 id 已存在（如"思考中"占位）则原地替换，否则追加。"""
+        for i, hs in enumerate(history_steps):
+            if hs.get("id") == step_dict.get("id"):
+                history_steps[i] = step_dict
+                break
+        else:
+            history_steps.append(step_dict)
 
     # Emit pre-loaded skill as an SSE step before agent starts processing
     # 如果预匹配了技能，在 agent 开始处理前先发一个 "Load Skill" SSE step
@@ -4826,6 +4833,25 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
                         )
                         round_step_map[round_num] = pending_step_id
                         yield pending_step_event  # 推 step.start
+                        # 同步到 live steps：先显示一个 running 占位，act 完成时替换为真实 step
+                        history_steps.append(
+                            {
+                                "id": pending_step_id,
+                                "title": "思考中",
+                                "detail": "Thought/Action/Observation",
+                                "thought": None,
+                                "action_intention": None,
+                                "action_reason": None,
+                                "action": None,
+                                "action_input": None,
+                                "outputs": [],
+                                "status": "running",
+                            }
+                        )
+                    # 注意：不要把思考文本 push 成 step.chunk —— 该 step 在 act 时会被
+                    # 重命名为 action 名（如 code_interpreter），text chunk 会被前端
+                    # 当成工具输出/代码渲染，污染输出框。思考文本只存 pending_thoughts，
+                    # 由 step.meta.thought 展示。
 
         elif event_type == "act":  # act 事件：action 已执行完成
             # Create step ONLY when action is confirmed
@@ -4861,6 +4887,12 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
                 pending_thoughts.pop(round_num, [])  # 清空缓存
                 pending_action_intentions.pop(round_num, None)
                 pending_action_reasons.pop(round_num, None)
+                # 移除该轮"思考中"占位（terminate 不产出真实 step，避免残留 running 项）
+                round_pending_id = round_step_map.get(round_num)
+                if round_pending_id:
+                    history_steps[:] = [
+                        hs for hs in history_steps if hs.get("id") != round_pending_id
+                    ]
                 # ── Auto-complete all remaining todos on terminate ──
                 # ── terminate 时自动把所有未完成的 todo 标记为 completed ──
                 if _todo_list:
@@ -4965,7 +4997,7 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
                     _todo_step_title,
                     todo_meta=todo_meta,
                 )
-                history_steps.append(  # 记录到 history
+                _append_or_replace_step(  # 记录到 history（若已存在"思考中"占位则替换）
                     {
                         "id": round_step_map[round_num],
                         "title": _todo_step_title,
@@ -5146,7 +5178,7 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
             # --- 历史：终结 step ---
             if current_history_step is not None:
                 current_history_step["status"] = status
-                history_steps.append(current_history_step)
+                _append_or_replace_step(current_history_step)  # 替换"思考中"占位或新增
                 current_history_step = None
 
     try:
@@ -5167,6 +5199,7 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
         storage_conv.add_view_message(error_payload)  # 写入会话 view 消息
         storage_conv.end_current_round()  # 结束本轮
         storage_conv.save_to_storage()  # 保存
+        _LIVE_AGENT_STEPS.pop(conv_id, None)  # 运行结束：移除实时状态，前端据此 reload
         yield _sse_event({"type": "final", "content": err_msg})  # 推 final
         yield _sse_event({"type": "done"})  # 推 done
         return
@@ -5193,6 +5226,30 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
                         final_content = parsed_input["result"]  # 提取 result
         except Exception:
             pass
+        # 提取 result 失败时（final 仍为原始 ReAct 文本，如 "Thought: ...答案..."），
+        # 做同样的清理：剥 ReAct 前缀 + 提取"最终答案"段，避免把思考草稿当最终答案。
+        if not final_content.strip() or re.match(
+            r"^(Thought|Action|Observation|Action Input)", final_content.strip(), re.I
+        ):
+            _cleaned = re.sub(
+                r"^(Thought|Action|Action Input|Observation|Phase):\s*",
+                "",
+                final_content,
+                flags=re.MULTILINE,
+            ).strip()
+            for _mk in ("**最终答案**", "最终答案：", "最终答案:", "**Final Answer**", "Final Answer:"):
+                _i = _cleaned.rfind(_mk)
+                if _i != -1:
+                    _cand = _cleaned[_i + len(_mk):]
+                    _cut = re.search(r"\n\s*(让我|我应该|不过|我需要确认|我认为|让我确认|让我尝试|考虑到|在\.\.\.)", _cand)
+                    if _cut:
+                        _cand = _cand[:_cut.start()]
+                    _cand = _cand.strip()
+                    if len(_cand) >= 20:
+                        _cleaned = _cand
+                        break
+            if _cleaned:
+                final_content = _cleaned
     elif reply.action_report:  # 循环结束但未 terminate（达到最大步数或超时）
         # Loop ended without terminate (max retries or timeout).
         # reply.content is raw LLM output containing ReAct prefixes.
@@ -5220,6 +5277,23 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
             final_content,
             flags=re.MULTILINE,
         ).strip()
+        # 模型常先草稿再给出"最终答案："段；循环结束时提取该段作为干净回复，
+        # 避免把整段思考草稿当最终答案展示。
+        for _mk in ("**最终答案**", "最终答案：", "最终答案:", "**Final Answer**", "Final Answer:"):
+            _i = final_content.rfind(_mk)
+            if _i != -1:
+                _cand = final_content[_i + len(_mk):]
+                # 截断到后续草稿标记（模型在最终答案后可能又开始"让我/我应该…"）
+                _cut = re.search(
+                    r"\n\s*(让我|我应该|不过|我需要确认|我认为|让我确认|让我尝试|考虑到|在\.\.\.)",
+                    _cand,
+                )
+                if _cut:
+                    _cand = _cand[:_cut.start()]
+                _cand = _cand.strip()
+                if len(_cand) >= 20:
+                    final_content = _cand
+                    break
         if not final_content:  # 仍为空时给默认提示
             final_content = "任务执行已达到最大步数限制，请查看上方各步骤的执行结果。"
     else:  # 没有 action_report
@@ -5241,6 +5315,7 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
     storage_conv.add_view_message(history_payload)  # 写入 view 消息
     storage_conv.end_current_round()  # 结束本轮
     storage_conv.save_to_storage()  # 保存
+    _LIVE_AGENT_STEPS.pop(conv_id, None)  # 运行结束：移除实时状态，前端据此 reload
 
     yield _sse_event({"type": "final", "content": final_content})  # 推 final
     yield _sse_event({"type": "done"})  # 推 done
@@ -5452,6 +5527,41 @@ async def download_skill_package(
         headers={
             "Content-Disposition": f'attachment; filename="{skill_name}.zip"',  # 下载文件名
         },
+    )
+
+
+@router.get("/v1/chat/dialogue/live")  # GET /v1/chat/dialogue/live：运行中会话的实时进度（前端轮询）
+async def dialogue_live_status(con_uid: str):
+    """查询某会话是否正在运行及其实时步骤进度。
+
+    供前端在"刷新页面后点回运行中的对话"时轮询：实时看到当前进度，
+    请求结束（generate_reply 返回）后 running 变 false。
+    """
+    from dbgpt.agent.core.base_agent import get_live_agent_steps
+
+    entry = get_live_agent_steps(con_uid)
+    if entry:
+        # 僵尸状态兜底：超过 15 分钟没有任何步骤更新，说明 agent 已挂起/连接已断，
+        # 不再视为"运行中"，避免前端发送按钮永远转圈、无法操作。
+        if time.time() - (entry.get("updated_at") or 0) > 900:
+            return Result.succ(
+                {
+                    "running": False,
+                    "steps": [],
+                    "user_input": None,
+                    "updated_at": None,
+                }
+            )
+        return Result.succ(
+            {
+                "running": True,
+                "steps": entry.get("steps", []),
+                "user_input": entry.get("user_input"),
+                "updated_at": entry.get("updated_at"),
+            }
+        )
+    return Result.succ(
+        {"running": False, "steps": [], "user_input": None, "updated_at": None}
     )
 
 

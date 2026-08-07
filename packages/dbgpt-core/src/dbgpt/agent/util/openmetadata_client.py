@@ -347,20 +347,28 @@ class OpenMetadataClient:
             return ""
 
     async def get_table_schema(self, table_name: str) -> str:
-        """返回指定表完整结构文本；失败/未启用返回空串。"""
+        """返回指定表完整结构文本；失败/未启用返回空串。
+
+        优先 REST API（确定性，直接返回列结构）；失败/未启用回退 MCP 工具。
+        注意：MCP 自动发现工具容易误匹配到 search_metadata 等搜索工具（需
+        query 参数），因此 table_schema_tool 为空时也优先走 REST。
+        """
         if not self.is_enabled:
             return ""
+        # 1) REST 优先（确定性，返回列结构）
+        try:
+            schema_text = await self._get_table_schema_rest(table_name)
+            if schema_text:
+                return schema_text
+        except Exception as e:
+            logger.warning(f"OpenMetadata get_table_schema(REST) failed: {e}")
+        # 2) MCP 兜底
         try:
             tool_name = self.config.table_schema_tool
             if not tool_name:
-                tool_name = await self._discover_tool(
-                    self.config.table_schema_desc_keywords
-                )
-            if not tool_name:
-                logger.warning("OpenMetadata get_table_schema: no tool matched")
-                return ""
+                # 默认用 get_entity_details（避免误匹配 search_metadata）
+                tool_name = "get_entity_details"
             if tool_name == "get_entity_details":
-                # get_entity_details 需要 entityType + fqn，fqn 用模板拼 schema.table
                 fqn = self.config.table_schema_fqn_template.format(
                     schema=self.config.schema or "", table=table_name
                 )
@@ -369,7 +377,82 @@ class OpenMetadataClient:
                 arguments = {self.config.table_schema_arg: table_name}
             return await self._call_tool(tool_name, arguments)
         except Exception as e:
-            logger.warning(f"OpenMetadata get_table_schema failed: {e}")
+            logger.warning(f"OpenMetadata get_table_schema(MCP) failed: {e}")
+            return ""
+
+    async def _get_table_schema_rest(self, table_name: str) -> str:
+        """通过 REST API 拉取指定表结构（列名/类型/描述）。
+
+        1. GET /api/v1/databaseSchemas?name=<schema> 定位 schema FQN
+        2. GET /api/v1/tables?databaseSchema=<fqn>&name=<table>&fields=columns
+           精确命中表名后返回列结构 JSON。失败返回空串。
+        """
+        base = self._rest_base_url()
+        schema = self.config.schema or ""
+        if not base or not schema or not table_name:
+            return ""
+        headers = {"Accept": "application/json", **self._build_headers()}
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=20) as client:
+                # 1) 定位 schema FQN
+                r = await client.get(
+                    f"{base}/api/v1/databaseSchemas",
+                    params={"name": schema, "limit": 100},
+                    headers=headers,
+                )
+                r.raise_for_status()
+                sfqn = None
+                for item in r.json().get("data", []):
+                    if item.get("name") == schema:
+                        sfqn = item.get("fullyQualifiedName")
+                        break
+                if not sfqn:
+                    logger.warning(
+                        f"OpenMetadata schema '{schema}' FQN not found for table schema"
+                    )
+                    return ""
+                # 2) 按 schema + 表名精确查找，带列结构
+                r2 = await client.get(
+                    f"{base}/api/v1/tables",
+                    params={
+                        "databaseSchema": sfqn,
+                        "name": table_name,
+                        "fields": "columns",
+                        "limit": 20,
+                    },
+                    headers=headers,
+                )
+                r2.raise_for_status()
+                target = None
+                for t in r2.json().get("data", []):
+                    if t.get("name") == table_name:
+                        target = t
+                        break
+                if not target:
+                    return ""
+                cols = target.get("columns") or []
+                result = {
+                    "table_name": table_name,
+                    "fully_qualified_name": target.get("fullyQualifiedName"),
+                    "description": self._shorten_desc(
+                        target.get("description") or "", self.config.description_max_chars
+                    ),
+                    "columns": [
+                        {
+                            "name": c.get("name"),
+                            "data_type": c.get("dataType"),
+                            "description": self._shorten_desc(
+                                c.get("description") or "", self.config.description_max_chars
+                            ),
+                        }
+                        for c in cols
+                    ],
+                }
+                return json.dumps(result, ensure_ascii=False)
+        except Exception as e:
+            logger.warning(f"OpenMetadata get_table_schema_rest failed: {e}")
             return ""
 
     async def _call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> str:
