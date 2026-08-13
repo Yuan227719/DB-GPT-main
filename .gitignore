@@ -214,3 +214,10 @@ test_kyuubi_repro.py
 test_sasl.py
 uv.exe
 check_db.py
+
+# Docker 镜像打包产物（大文件不入库）
+*.tar
+*.tar.*
+
+# 本地真实配置（含 API key），不提交
+configs/openai.toml
