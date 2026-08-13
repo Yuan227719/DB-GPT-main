@@ -480,7 +480,7 @@ function SideBar() {
           </Link>
         </div>
       </div>
-      <div className='flex-1 overflow-y-auto min-h-0'>
+      <div className='flex-1 overflow-y-auto min-h-0 scrollbar-default'>
         {loadingDialogues ? (
           <div className='px-2 pt-2'>
             <Skeleton active title={false} paragraph={{ rows: 4, width: '100%' }} />

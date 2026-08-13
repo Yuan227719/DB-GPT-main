@@ -87,6 +87,10 @@ REACT_AGENT_MEMORY_CACHE: Dict[str, "GptsMemory"] = {}
 # 首次涉库问题从 OpenMetadata/Kyuubi 拉一次，会话内后续请求复用注入 system prompt
 _TABLE_CATALOG_CACHE: Dict[str, Tuple[float, str]] = {}
 
+# 保持对 agent 后台任务（run_agent）的引用，防止 SSE 客户端断开、生成器被关闭
+# 时，任务因失去唯一引用而被 GC 取消——那样持久化（保存 view / 清 live）就不会执行。
+_ACTIVE_AGENT_TASKS: set = set()
+
 # 缓存 TTL（秒）：OpenMetadata 元数据（表描述/术语）更新后，最长 TTL 内重新拉取。
 # 可通过 TOML 的 openmetadata_cache_ttl_seconds 覆盖。
 _OM_CACHE_TTL = 1800  # 30 分钟
@@ -116,6 +120,159 @@ _GLOSSARY_WHITELIST = [
     "测试JSON结构",
 ]
 _GLOSSARY_CACHE: Dict[str, Tuple[float, str]] = {}
+
+# OpenMetadata 全表 表名→完整描述 缓存（进程级，TTL 同 _OM_CACHE_TTL）。
+# 由 _build_compact_catalog 构建时填充；get_table_info 按需取某表完整业务描述。
+_OM_TABLE_DESC_CACHE: Dict[str, Tuple[float, str]] = {}
+
+# 列语义修正：OpenMetadata 列描述有误/口径不全时，在此覆盖，get_table_info 输出 schema 前应用。
+# key = (表名, 列名)；value = 修正后的列描述。口径需与真实数据一致（2026-08-11 数据核实）。
+_COLUMN_SEMANTIC_OVERRIDES: Dict[Tuple[str, str], str] = {
+    (
+        "dwd_dut_result_w",
+        "burnin_time",
+    ): "各测项 time_elapse 的全量拷贝（随 item 变化，非样品级常量），不是真正的烧录时长。"
+    "真正烧录时长在 dwd_fa_ecc_die_di.burnin_time（eMMC 由 VDT_INFO_CYCLE_/VDT_COUNT_VCC% 过滤得到）。",
+    (
+        "dwd_fa_ecc_die_di",
+        "burnin_time",
+    ): "样品 Burnin（老化）烧录时长，单位秒，最准来源。"
+    "eMMC 产品线特有：由宽表 VDT_INFO_CYCLE_/VDT_COUNT_VCC% 行的 time_elapse 过滤得到（值域约 42~288，avg 约 218）。"
+    "注意：历史数据可能有 min（分钟）形式（旧口径，需×60 换算），现行为秒；"
+    "eUFS 等无 VDT 测项的产品此字段为空。",
+}
+
+# 方案6A：表 → "适用场景"路由提示（信息型，不加命令条款）。
+# 紧凑表清单行尾追加"｜ 适用: ..."，让 agent 扫一眼即可定位目标表，避免反复 sql_query 探索。
+# 原则：DWD 层优先于 ODS 层（DWD 已清洗并关联 dim 补全 flash_pn/item_control 等字段，信息更完整）。
+_TABLE_ROUTING_HINTS: Dict[str, str] = {
+    "ods_mes_production_report": "MES 原始报表核对（原口径）、MES vs log 缺失比对",
+    "ods_dut_result": "原始测试记录（日志级核对/回溯，已加工见 dwd_dut_result）",
+    "ods_dut_result_item": "原始测项（日志级核对，已加工见 dwd_dut_result_item）",
+    "ods_dut_result_subitem": "原始子项值（日志级核对，已加工见 dwd_dut_result_subitem）",
+    "dim_base_project": "项目配置：颗粒映射/PN/阈值（slc/tlc/qlc、DPPM、温度、电流）/BIBB",
+    "dim_base_sn_di": "串号查询：UID→SN、EFUSE ID、行转列维度字段（Port/FlashID/SerialNumber）",
+    "dim_base_wo_di": "工单信息：状态/分类/返测单、订单、委外厂商、数量、产品",
+    "dim_dqc_db": "DB/zip 文件解析状态",
+    "dim_dqc_state": "数据质量异常（WO_LOSS/DUPLICATE/NULL_FIELD）、处理状态/根因",
+    "dwd_dqc_psn": "PSN 跨工单/PN 重复检测",
+    "dwd_dut_result": "DUT 测试明细首选（已补全 flash_pn/item_control，note 解析 test_number/machine_id/test_type）：站位/机台/测试类型",
+    "dwd_dut_result_item": "测项明细首选：RDT/ECC/功耗测项执行结果",
+    "dwd_dut_result_subitem": "子项明细首选：子项值/规格上下限",
+    "dwd_dut_result_w": "测项子项展开宽表：指标值（ECC/SleepCurrent/温度/VDT_COUNT）+维度值（软件包/Port）。注意 burnin_time 是各测项 time_elapse 的全量拷贝（非真烧录时长），真烧录时长在 dwd_fa_ecc_die_di",
+    "dwd_mes_lot": "MES 生产明细首选（已补全 flash_pn/item_control）：按项目/颗粒维度的良率/投入产出/lot 明细",
+    "dwd_fa_bb_block": "block 级坏块明细：GBB 块位置/类型",
+    "dwd_fa_ecc_block": "block 级 ECC 值",
+    "dwd_fa_ecc_die_di": "die 级 ECC：温度（nand/controller start-end）、VDT 计数、Burnin 烧录时长（最准，eMMC VDT_INFO_CYCLE_/VDT_COUNT_VCC% 过滤，单位秒，历史可能有 min 形式）",
+    "dwd_fa_ecc_plane_di": "plane 级 ECC 字符串",
+    "dwd_power_current_di": "电流值/电流分布比例/电流规格判定（500-550 范围等）",
+    "dwd_power_temperature_di": "nandTj/controller 温度、VDT 计数（无烧录时长）",
+    "dws_fa_bb_block": "坏块汇总：减坏块良率损失、FBB/GBB 分布",
+    "dws_fa_ecc_cycle": "cycle 级坏块统计",
+    "dws_fa_ecc_cycle_stat": "cycle 坏块分布：max/min ECC、样本数",
+    "dws_fa_ecc_die": "die 级坏块统计",
+    "dws_fa_ecc_die_stat": "die 坏块分布统计",
+    "dws_fa_ecc_plane": "plane 级坏块分类：FBB/GBB/HECC 定义、坏块率",
+    "dws_indicator_d": "日粒度指标值（{flash_pn}_fbb_ratio_sn 等）",
+    "dws_indicator_w": "周良率/坏块比率/批次波动/周报指标（_fbb_ratio_wo 等）",
+    "ads_fa_fbc_cycle": "箱线图分析：FBC/ECC cycle 分布、四分位数/异常值",
+}
+
+# 方案：规则路由（意图识别→选表）。关键词 → 候选表，route_tables 按命中数排序取 top-k。
+# 注意：dws_indicator_w 是周粒度指标表，只在 周/ECC分布/表内指标字眼 时路由（用户业务规则），
+# 不用"良率/坏块/批次"等泛词误路由（DWD 优先于 ODS，见 _TABLE_ROUTING_HINTS 原则）。
+_ROUTING_KEYWORDS: Dict[str, List[str]] = {
+    "周": ["dws_indicator_w"],
+    "周报": ["dws_indicator_w"],
+    "周ecc": ["dws_indicator_w"],
+    "ecc分布": ["dws_indicator_w"],
+    "周分布": ["dws_indicator_w"],
+    "fbb比率": ["dws_indicator_w"],
+    "fbb_ratio": ["dws_indicator_w"],
+    "fbb异常": ["dws_indicator_d"],
+    "指标": ["dws_indicator_d", "dws_indicator_w"],
+    "良率": ["ods_mes_production_report", "dwd_mes_lot","dws_indicator_w"],
+    "工单": ["dim_base_wo_di", "dwd_dut_result_w", "dwd_dut_result"],
+    "errorcode": ["ods_mes_production_report", "dwd_dut_result", "dwd_mes_lot"],
+    "错误码": ["ods_mes_production_report", "dwd_dut_result", "dwd_mes_lot"],
+    "失效": ["ods_mes_production_report", "dwd_mes_lot", "dwd_dut_result"],
+    "测项": ["dwd_dut_result_item", "dwd_dut_result_w"],
+    "item": ["dwd_dut_result_item", "dwd_dut_result_w"],
+    "子项": ["dwd_dut_result_subitem", "dwd_dut_result_w"],
+    "subitem": ["dwd_dut_result_subitem", "dwd_dut_result_w"],
+    "功耗": ["dwd_power_current_di", "dwd_power_temperature_di"],
+    "电流": ["dwd_power_current_di"],
+    "温度": ["dwd_power_temperature_di"],
+    "nandtj": ["dwd_power_temperature_di"],
+    # Burnin 烧录时长：最准来源是 dwd_fa_ecc_die_di（VDT 过滤后，eMMC 特有）。
+    # 宽表 dwd_dut_result_w.burnin_time 只是 time_elapse 全量拷贝，非真烧录时长，
+    # 故 burnin 关键词只路由 fa（dwd_dut_result_w 仍会经"工单/测项/时长"等词命中）。
+    "burnin": ["dwd_fa_ecc_die_di"],
+    "burin": ["dwd_fa_ecc_die_di"],
+    "burn-in": ["dwd_fa_ecc_die_di"],
+    "burn in": ["dwd_fa_ecc_die_di"],
+    "烧录": ["dwd_fa_ecc_die_di"],
+    "老化": ["dwd_fa_ecc_die_di"],
+    "时长": ["dwd_dut_result_w"],
+    "坏块": ["dwd_fa_bb_block", "dws_fa_bb_block", "dws_fa_ecc_plane"],
+    "gbb": ["dwd_fa_bb_block", "dws_fa_bb_block"],
+    "fbb": ["dws_fa_bb_block", "dws_fa_ecc_plane"],
+    "ecc": ["dws_fa_ecc_plane", "dwd_fa_ecc_plane_di", "dws_fa_ecc_cycle", "dws_fa_ecc_die", "dws_fa_ecc_cycle_stat"],
+    "分布": ["dws_fa_ecc_cycle_stat", "dws_fa_ecc_die_stat", "ads_fa_fbc_cycle"],
+    "plane": ["dws_fa_ecc_plane", "dwd_fa_ecc_plane_di"],
+    "uid": ["dim_base_sn_di"],
+    "sn": ["dim_base_sn_di"],
+    "串号": ["dim_base_sn_di"],
+    "订单": ["dim_base_wo_di"],
+    "软件包": ["dwd_dut_result_w"],
+    "软件版本": ["dwd_dut_result_w"],
+    "log": ["ods_dut_result", "dwd_dut_result_w"],
+    "日志": ["ods_dut_result", "dwd_dut_result_w"],
+    "站位": ["dwd_dut_result", "dwd_dut_result_w"],
+    "station": ["dwd_dut_result"],
+    "返测": ["dim_base_wo_di","ods_mes_production_report", "dwd_mes_lot"],
+    "mes": ["ods_mes_production_report", "dwd_mes_lot"],
+    "dppm": ["dws_indicator_w", "dws_indicator_d","ods_mes_production_report", "dwd_mes_lot","dim_base_project"],
+    "lot": ["dwd_mes_lot", "ods_mes_production_report","dwd_dut_result"],
+    "箱线图": ["ads_fa_fbc_cycle"],
+    "数据质量": ["dim_dqc_state","dim_dqc_db"],
+    "dqc": ["dim_dqc_state","dim_dqc_db"],
+    "psn": ["dwd_dqc_psn","dim_dqc_db"],
+    "db文件": ["dim_dqc_db"],
+    "投入量": ["ods_mes_production_report", "dwd_mes_lot"],
+    "良品": ["ods_mes_production_report", "dwd_mes_lot"],
+    "fwerror": ["dim_base_sn_di", "dws_fa_ecc_plane", "dwd_fa_bb_block","dwd_fa_ecc_die_di"],
+    "vperror": ["dim_base_sn_di", "dws_fa_ecc_plane", "dwd_fa_bb_block","dwd_fa_ecc_die_di","dwd_power_current_di"],
+    "vdt": ["dwd_power_temperature_di", "dwd_fa_ecc_die_di"],
+    "失效dppm": ["dws_indicator_w", "dws_indicator_d","ods_mes_production_report", "dwd_mes_lot","dim_base_project"],
+}
+
+# 知识源触发词（方案 3.4）：失效/不良代码含义 → 术语库；查原因 → 知识库（待建，先标记）
+_ROUTING_GLOSSARY_TERMS = [
+    "errorcode", "错误码", "不良", "含义", "定义", "fwerror", "vperror", "失效",
+]
+_ROUTING_KNOWLEDGE_TERMS = [
+    "原因", "根因", "怎么解决", "为什么", "解决方案",
+]
+
+
+def route_tables(question: str, top_k: int = 8):
+    """问题 → (候选数据表 top-k, 知识源标记 {"glossary": bool, "knowledge": bool})。
+
+    规则路由：问题里含哪些业务关键词 → 对应表各 +1 票 → 按票数排序取 top-k；
+    同时识别知识源触发词（术语库 / 知识库）。
+    """
+    q = question.lower()
+    votes: Dict[str, int] = {}
+    for kw, tables in _ROUTING_KEYWORDS.items():
+        if kw in q:
+            for t in tables:
+                votes[t] = votes.get(t, 0) + 1
+    ranked = sorted(votes.items(), key=lambda x: -x[1])
+    tables = [t for t, _ in ranked[:top_k]]
+    glossary = any(kw in q for kw in _ROUTING_GLOSSARY_TERMS)
+    knowledge = any(kw in q for kw in _ROUTING_KNOWLEDGE_TERMS)
+    return tables, {"glossary": glossary, "knowledge": knowledge}
 
 # 默认技能目录（来自全局配置）
 DEFAULT_SKILLS_DIR = SKILLS_DIR
@@ -420,13 +577,82 @@ def _load_openmetadata_config() -> "OpenMetadataConfig":
     return defaults
 
 
+def _load_dolphinscheduler_config() -> "DolphinSchedulerConfig":
+    """从 connector_instance 自动发现 dolphinscheduler connector，解密凭证。
+
+    connector 存 server_uri / project_code（config_json）+ token（加密）。
+    未配置/失败返回 disabled 默认值，不阻塞主流程。
+    """
+    from dbgpt.agent.util.dolphinscheduler_client import DolphinSchedulerConfig
+
+    defaults = DolphinSchedulerConfig()
+    try:
+        from dbgpt.agent.resource.connector.credential import CredentialStore
+        from dbgpt_serve.connector.models.models import ConnectorInstanceEntity
+        from dbgpt_serve.connector.service.service import ConnectorService
+
+        svc = ConnectorService.get_instance(CFG.SYSTEM_APP)
+        for c in svc.list_connectors() or []:
+            label = f"{c.display_name or ''} {c.connector_type or ''}".lower()
+            if "dolphinscheduler" not in label:
+                continue
+            cfg_map = c.config or {}
+            server_uri = cfg_map.get("server_uri") or ""
+            project_code = str(cfg_map.get("project_code") or "")
+            if not server_uri:
+                continue
+            token = ""
+            try:
+                with svc._dao.session() as session:
+                    entity = (
+                        session.query(ConnectorInstanceEntity)
+                        .filter(ConnectorInstanceEntity.connector_id == c.connector_id)
+                        .first()
+                    )
+                    if entity is not None:
+                        enc_creds = entity.encrypted_credentials
+                        salt = entity.encryption_salt
+                if enc_creds and salt:
+                    creds = CredentialStore(system_app=CFG.SYSTEM_APP).decrypt(enc_creds, salt)
+                    token = str(creds.get("token", "") or "")
+            except Exception as e:
+                logger.warning(f"DolphinScheduler credentials decrypt failed: {e}")
+            logger.info(
+                f"Auto-detected DolphinScheduler connector @ {server_uri} "
+                f"project={project_code} token_set={bool(token)}"
+            )
+            return DolphinSchedulerConfig(
+                enabled=True,
+                server_uri=server_uri,
+                project_code=project_code,
+                token=token,
+            )
+    except Exception as e:
+        logger.debug(f"DolphinScheduler connector auto-detect failed: {e}")
+    return defaults
+
+
+def _extract_biz_definition(desc: str) -> str:
+    """提取完整描述中的【业务定义】段（其余【粒度】【指标】【核心维度】【核心字段】不要）。"""
+    if not desc:
+        return ""
+    m = re.search(r"【业务定义】(.*?)(?:【|$)", desc, re.S)
+    return m.group(1).strip() if m else ""
+
+
 async def _build_compact_catalog(
     database_connector: Any, conv_id: str, om_config: "OpenMetadataConfig"
 ) -> str:
-    """构造会话级紧凑表清单（表名 + 描述），并写入 conv_id 维度会话缓存。
+    """构造会话级紧凑表清单（每表一行：表名 + 【业务定义】+ 适用），并写入 conv_id 会话缓存。
 
-    优先 OpenMetadata（数据目录，含业务描述）；未启用/失败时降级到 Kyuubi
-    （仅表名清单）。全部 try/except 包裹，不阻塞主流程。
+    只取完整描述里的【业务定义】段（表是干什么的，简短），【粒度】【指标】【核心维度】
+    【核心字段】等其余段落不拼进 prompt（改由 get_table_info 按需取）。同时把 OpenMetadata
+    的 表名→完整描述 填入 _OM_TABLE_DESC_CACHE，供 get_table_info 复用。
+
+    注：保留【业务定义】是为了路由未命中时模型仍能从表描述自选目标表（2026-08-11 决策）。
+
+    优先 OpenMetadata；未启用/失败时降级到 Kyuubi（仅表名清单）。
+    全部 try/except 包裹，不阻塞主流程。
     """
     from dbgpt.agent.util.openmetadata_client import OpenMetadataClient
 
@@ -451,7 +677,22 @@ async def _build_compact_catalog(
             for t in tables or []:
                 name = t.get("name", "")
                 desc = t.get("description", "")
-                lines.append(f"- {name}: {desc}" if desc else f"- {name}")
+                if not name:
+                    continue
+                # 完整描述只进缓存，供 get_table_info 按需取，不拼进 prompt
+                _OM_TABLE_DESC_CACHE[name] = (time.time(), desc or "")
+                # 只取【业务定义】段（表是干什么的），其余段落不要；路由未命中时模型靠它自选表
+                biz = _extract_biz_definition(desc)
+                hint = _TABLE_ROUTING_HINTS.get(name)
+                if biz:
+                    line = f"- {name}: {biz}"
+                    if hint:
+                        line += f" ｜ 适用: {hint}"
+                elif hint:
+                    line = f"- {name} ｜ 适用: {hint}"
+                else:
+                    line = f"- {name}"
+                lines.append(line)
             if lines:
                 logger.info(
                     f"Built compact catalog from {source}: {len(lines)} tables"
@@ -493,6 +734,14 @@ async def _build_glossary_section(om_config: "OpenMetadataConfig") -> str:
         lines = ["## 业务术语与口径"]
         for name, desc in terms.items():
             lines.append(f"- {name}: {desc}")
+        # 内置补充术语：OM 术语库暂时没有的 Burnin 概念先硬编码在此，保证 prompt 可见；
+        # 后续在 OpenMetadata 术语库补了同名术语后，可删除本行。
+        lines.append(
+            "- 烧录/Burnin（老化）: 可靠性老化测试，样品烧录时长单位秒。"
+            "最准来源是 dwd_fa_ecc_die_di.burnin_time（eMMC 特有，由 VDT_INFO_CYCLE_/VDT_COUNT_VCC%"
+            " 测项的 time_elapse 过滤得到；历史可能有 min 分钟形式需×60，现行为秒；eUFS 等无 VDT 产品为空）。"
+            "注意宽表 dwd_dut_result_w.burnin_time 只是各测项 time_elapse 的拷贝，不是真烧录时长。"
+        )
         section = "\n".join(lines)
         _GLOSSARY_CACHE[_GLOSSARY_NAME] = (time.time(), section)
         logger.info(
@@ -1571,6 +1820,16 @@ async def _react_agent_stream(
     storage_conv.add_user_message(user_input)  # 加入用户消息
     storage_conv.save_to_storage()  # 立即落库 human 消息
 
+    # 【提前注册实时状态】在慢速初始化（skills/connectors/glossary/agent build）之前
+    # 就注册 live，否则用户发送后立刻刷新时 /live 尚未注册会返回 running=false，
+    # 前端不会进入 live 轮询，思考胶囊等实时内容不显示。后续(5408)会替换为真实 history_steps。
+    _LIVE_AGENT_STEPS[conv_id] = {
+        "steps": [],  # 占位：真实 history_steps 在下方初始化后替换
+        "user_input": user_input,
+        "task_plan": [],
+        "updated_at": time.time(),
+    }
+
     # 从 ext_info 解析各种上下文标识
     file_path = None  # 上传文件路径
     knowledge_space = None  # 知识库名
@@ -1942,16 +2201,37 @@ async def _react_agent_stream(
                 )
             # 业务术语与口径：从 OpenMetadata 术语库拉取（进程级缓存，如"商规EMBED生产测试术语库"）
             glossary_section = await _build_glossary_section(om_config)
+            # 规则路由：识别问题相关表 + 知识源（术语库/知识库）
+            _q = getattr(dialogue, "user_input", "") or ""
+            routed_tables, route_flags = route_tables(_q)
+            route_section = ""
+            if routed_tables:
+                route_section = (
+                    "\n## 本次问题相关表（路由识别）\n"
+                    "- 建议优先用 'get_table_info(表名)' 取这些表的完整信息（描述/结构/血缘/计算逻辑）：\n"
+                    + "  " + "、".join(routed_tables)
+                )
+            knowledge_section = ""
+            if route_flags["glossary"]:
+                knowledge_section += "\n- errorcode/不良代码/失效 含义 → 用 'get_glossary_term(术语名)' 查术语库"
+            if route_flags["knowledge"]:
+                knowledge_section += "\n- 失效原因/经验/解决方案 → 用 'knowledge_retrieve(...)' 查知识库"
+            if knowledge_section:
+                knowledge_section = "\n## 术语与知识辅助\n" + knowledge_section.strip()
             # database_context 注入到 system prompt 的 {database_context} 占位符
             database_context = f"""
 ## 数据库信息
 - 数据库名: {database_name}
 {db_catalog}
+{route_section}
 {glossary_section}
-- 使用 'sql_query' 工具执行 SQL 查询；若不确定列名，先用 'get_table_schema' 查看表结构
-- 需要理解 errorcode/测项/指标等业务术语含义时，先用 'get_glossary_term' 查询术语库
+{knowledge_section}
+## 工具说明
+- 需要某表完整信息（业务描述/结构/血缘/计算逻辑）→ 用 'get_table_info(表名)' 一次拿全
+- 只查表结构（列名/类型）→ 'get_table_schema(表名)'；只查血缘/计算逻辑/上下游 → 'get_lineage(表名)'
+- 理解 errorcode/测项/指标等业务术语含义 → 'get_glossary_term(术语名)'
 - 当前数据库 schema 是 st_embed（查业务字典表才是 embed_db / masterdata_db）
-- 某查询返回空时，换用其他表或直接基于已有信息回答，禁止重复执行同一查询
+- 若所选表查不到所需数据，用 'get_lineage(表名)' 追上下游换表再查，或 'get_table_schema(任意表)' 探索确认
 - **只允许 SELECT 查询，禁止 INSERT/UPDATE/DELETE/DROP/ALTER/TRUNCATE**
 - **SQL 必须用 Trino/Presto 语法**（底层是 Trino）：日期字面量用 `DATE '2026-07-27'`（不要用 `'2026-07-27'` 直接比 DATE 列）；字符串列转数值用 `CAST(x AS DOUBLE)`/`TRY_CAST`；百分比如 `'98.00%'` 用 `CAST(REPLACE(yield, '%', '') AS DOUBLE)` 转换；列名/别名若含保留字需加反引号
 """
@@ -2736,7 +3016,27 @@ print(json.dumps(summary, ensure_ascii=False))
                     table_name
                 )
                 if schema_text and schema_text.strip():
-                    return schema_text
+                    # OpenMetadata MCP 有时把"表未找到"错误当成功文本返回（如
+                    # "Error executing tool: table instance ... not found"）。
+                    # 识别错误文本后视为未命中，回退 Kyuubi 取真实表结构。
+                    _low = schema_text.lower()
+                    if not any(
+                        k in _low
+                        for k in (
+                            "not found",
+                            "error executing tool",
+                            "error:",
+                            "找不到",
+                            "不存在",
+                            "failed",
+                            "404",
+                        )
+                    ):
+                        return schema_text
+                    logger.info(
+                        "get_table_schema(OpenMetadata) 返回错误文本，回退 Kyuubi: %s",
+                        schema_text[:120],
+                    )
         except Exception as e:
             logger.warning(f"get_table_schema(OpenMetadata) failed: {e}")
         # 2) Kyuubi / DB 兜底
@@ -2760,8 +3060,9 @@ print(json.dumps(summary, ensure_ascii=False))
     @tool(
         description=(
             "查询 OpenMetadata 术语库中某个业务术语的详细定义（如 ErrorCode、测项、指标口径）。"
-            "当需要理解 errorcode 含义、测项定义、指标来源时调用。"
-            '参数: {"term_name": "术语名，如 不良代码（ErrorCode）、ECC测试项"}'
+            "当需要理解 errorcode 含义、测项定义、指标来源时调用；"
+            "传父术语名（如 不良代码（ErrorCode））会返回其全部子术语的完整字典。"
+            '参数: {"term_name": "术语名，如 不良代码（ErrorCode）、90"}'
         )
     )
     async def get_glossary_term(term_name: str) -> str:
@@ -2793,6 +3094,197 @@ print(json.dumps(summary, ensure_ascii=False))
         return json.dumps(
             {"error": f"未找到术语 {term_name}"}, ensure_ascii=False
         )
+
+    @tool(
+        description=(
+            "查询某张表的上下游血缘与字段映射（来自 DolphinScheduler ETL SQL 实时解析）。"
+            "当需要知道一张表由哪些表加工而来（upstream）、被哪些表消费（downstream）、"
+            "或某列是怎么算出来的（字段映射）时调用。"
+            '参数: {"table_name": "表名，如 st_embed.dws_indicator_d"}'
+        )
+    )
+    async def get_lineage(table_name: str) -> str:
+        """按需返回某表血缘：上游/下游/字段级映射（版本驱动增量刷新）。
+
+        Args:
+            table_name: 表名（可带 schema，如 st_embed.dws_indicator_d）
+        """
+        try:
+            from dbgpt.agent.util.dolphinscheduler_client import DolphinSchedulerClient
+
+            ds_cfg = _load_dolphinscheduler_config()
+            if not (ds_cfg.enabled and ds_cfg.server_uri):
+                return json.dumps(
+                    {"error": "DolphinScheduler 未配置，无法查询血缘"}, ensure_ascii=False
+                )
+            client = DolphinSchedulerClient(ds_cfg)
+            info = await client.get_table_lineage(table_name)
+            if not info.get("found"):
+                return json.dumps(
+                    {"error": f"未找到表 {table_name} 的血缘"}, ensure_ascii=False
+                )
+            return json.dumps(info, ensure_ascii=False)
+        except Exception as e:
+            logger.warning(f"get_lineage failed: {e}")
+            return json.dumps({"error": f"get_lineage 失败: {e}"}, ensure_ascii=False)
+
+    @tool(
+        description=(
+            "返回指定表的完整信息：业务描述（OpenMetadata）+ 结构（列/类型）+ "
+            "DolphinScheduler 血缘与计算逻辑（列←表达式、上下游表、构建工作流）。"
+            "当需要深入理解某张表的用途、字段怎么算、由哪些表构建时调用，一次拿全，"
+            "无需分别调 get_table_schema / get_lineage。"
+            '参数: {"table_name": "表名，如 st_embed.dws_indicator_w"}'
+        )
+    )
+    async def get_table_info(table_name: str) -> str:
+        """一次返回某表完整信息：业务描述 + 结构 + 血缘/计算逻辑 + 上下游。"""
+        if not table_name:
+            return json.dumps({"error": "table_name 不能为空"}, ensure_ascii=False)
+        table = table_name.rsplit(".", 1)[-1]
+        result: Dict[str, Any] = {"table": table_name}
+        # 1) 完整业务描述（OpenMetadata，缓存优先；缓存未命中再拉全表）
+        try:
+            om_cfg = _load_openmetadata_config()
+            if om_cfg.enabled and om_cfg.server_uri:
+                cached = _OM_TABLE_DESC_CACHE.get(table)
+                desc = (
+                    cached[1]
+                    if _is_cache_fresh(cached, om_cfg.cache_ttl_seconds)
+                    else ""
+                )
+                if not desc:
+                    from dbgpt.agent.util.openmetadata_client import OpenMetadataClient
+
+                    tables = await OpenMetadataClient(om_cfg).list_tables_rest()
+                    for t in tables or []:
+                        if t.get("name"):
+                            _OM_TABLE_DESC_CACHE[t["name"]] = (
+                                time.time(),
+                                t.get("description") or "",
+                            )
+                    desc = _OM_TABLE_DESC_CACHE.get(table, (time.time(), ""))[1]
+                if desc:
+                    result["description"] = desc
+        except Exception as e:
+            logger.warning(f"get_table_info(description) failed: {e}")
+        # 2) 结构（复用 OpenMetadata REST；Kyuubi 兜底）
+        try:
+            om_cfg2 = _load_openmetadata_config()
+            schema_text = ""
+            if om_cfg2.enabled and om_cfg2.server_uri:
+                from dbgpt.agent.util.openmetadata_client import OpenMetadataClient
+
+                # schema 为空时从 DB connector 推导（同 get_table_schema）
+                if not om_cfg2.schema and database_connector is not None:
+                    getter = getattr(
+                        database_connector, "get_current_db_name", None
+                    )
+                    if callable(getter):
+                        try:
+                            om_cfg2.schema = getter() or ""
+                        except Exception:
+                            om_cfg2.schema = ""
+                schema_text = await OpenMetadataClient(om_cfg2).get_table_schema(
+                    table_name
+                )
+                _low = schema_text.lower()
+                if any(
+                    k in _low
+                    for k in (
+                        "not found",
+                        "error executing tool",
+                        "error:",
+                        "找不到",
+                        "不存在",
+                        "failed",
+                        "404",
+                    )
+                ):
+                    schema_text = ""
+            if not schema_text and database_connector is not None:
+                table_info = database_connector.get_table_info([table_name])
+                if table_info and table_info.strip():
+                    schema_text = table_info
+            if schema_text and schema_text.strip():
+                # A: 顶层 result["description"] 已含完整表描述（与 schema.description 重复），
+                # 去掉 schema 里的重复项，避免同一段描述出现两次。
+                if "description" in result:
+                    try:
+                        _obj = json.loads(schema_text)
+                        if isinstance(_obj, dict):
+                            _obj.pop("description", None)
+                            # 列语义修正：覆盖有误/不全的列描述（如 burnin_time 口径）
+                            for _c in _obj.get("columns") or []:
+                                _fix = _COLUMN_SEMANTIC_OVERRIDES.get(
+                                    (table, _c.get("name"))
+                                )
+                                if _fix:
+                                    _c["description"] = _fix
+                            schema_text = json.dumps(_obj, ensure_ascii=False)
+                    except Exception:
+                        pass
+                result["schema"] = schema_text
+        except Exception as e:
+            logger.warning(f"get_table_info(schema) failed: {e}")
+        # 3) 血缘/计算逻辑/上下游（DolphinScheduler；完整名优先，裸名兜底）
+        try:
+            from dbgpt.agent.util.dolphinscheduler_client import DolphinSchedulerClient
+
+            ds_cfg = _load_dolphinscheduler_config()
+            if ds_cfg.enabled and ds_cfg.server_uri:
+                client = DolphinSchedulerClient(ds_cfg)
+                lg = await client.get_table_lineage(table_name)
+                if not lg.get("found") and table != table_name:
+                    lg = await client.get_table_lineage(table)
+                if lg.get("found"):
+                    result["upstream"] = lg.get("upstream") or []
+                    result["downstream"] = lg.get("downstream") or []
+                    # C: fields 瘦身——只保留"有计算/改名/别名派生"的列：
+                    #   1) expr!=列名 或 refs!=列名：本表 SQL 内真实变换/改名（如 NOW()、dim.xxx）
+                    #   2) 恒等映射但列描述表明"取自/来自/解析/别名/派生"的派生列
+                    #      （如 burnin_time 取自 dwd_dut_result_item 的 time_elapse、
+                    #        test_number 从 note 的 JSON 字段解析）——血缘解析器抓不到这类改名，
+                    #        只能靠列描述保留，expr 直接放描述让模型看到对应关系
+                    #   恒等透传且无派生关系的列丢弃（列描述仍在 schema 里，信息不丢）。
+                    _fields: Dict[str, Any] = {}
+                    _schema_obj: Dict[str, Any] = {}
+                    _s = result.get("schema")
+                    if isinstance(_s, str) and _s.strip():
+                        try:
+                            _schema_obj = json.loads(_s)
+                        except Exception:
+                            _schema_obj = {}
+                    _col_desc = {
+                        (c.get("name") or ""): str(c.get("description") or "")
+                        for c in (_schema_obj.get("columns") or [])
+                        if isinstance(c, dict)
+                    }
+                    _derived_kw = ("取自", "来自", "解析", "别名", "派生")
+                    for _col, _meta in (lg.get("fields") or {}).items():
+                        if not isinstance(_meta, dict):
+                            continue
+                        _expr = str(_meta.get("expr") or "")
+                        _refs = _meta.get("refs") or []
+                        _is_identity = _expr == _col and _refs == [_col]
+                        if not _is_identity:
+                            _fields[_col] = _meta
+                        elif _col_desc.get(_col) and any(
+                            k in _col_desc[_col] for k in _derived_kw
+                        ):
+                            _fields[_col] = {"expr": _col_desc[_col], "refs": _refs}
+                    if _fields:
+                        result["fields"] = _fields
+                    result["build_workflows"] = lg.get("build_workflows") or []
+        except Exception as e:
+            logger.warning(f"get_table_info(lineage) failed: {e}")
+        if not any(
+            k in result for k in ("description", "schema", "fields")
+        ):
+            return json.dumps(
+                {"error": f"未找到表 {table_name} 的信息"}, ensure_ascii=False
+            )
+        return json.dumps(result, ensure_ascii=False)
 
     def _try_repair_truncated_code(raw_code: str) -> Optional[str]:
         """尝试修复被 LLM token 上限截断的代码。
@@ -3804,6 +4296,33 @@ print(json.dumps(summary, ensure_ascii=False))
         except Exception:
             pass
 
+        # 修复 <script> 内引号字符串中的真实换行 → \n 转义。
+        # 模型常用 code_interpreter 写 HTML 文件，Python 会把 'MT0\n07-28'
+        # 里的 \n 写成真实换行，浏览器解析 JS 时报
+        # "SyntaxError: Invalid or unexpected token"，echarts 初始化失败、
+        # 图表区空白（静态表格不受影响）。
+        def _repair_script_newlines(_html: str) -> str:
+            def _repair(_m: "re.Match") -> str:
+                _script = _m.group(1)
+
+                def _fix_str(_sm: "re.Match") -> str:
+                    _quote = _sm.group(1)
+                    _body = _sm.group(2)
+                    if "\n" in _body:
+                        _body = _body.replace("\n", "\\n")
+                    return _quote + _body + _quote
+
+                return "<script>" + re.sub(
+                    r"(['\"])((?:[^'\"\\]|\\.|\n)*?)\1", _fix_str, _script
+                ) + "</script>"
+
+            return re.sub(r"<script>(.*?)</script>", _repair, _html, flags=re.S)
+
+        try:
+            fixed_html = _repair_script_newlines(fixed_html)
+        except Exception:
+            pass  # 修复失败不影响渲染
+
         chunks: List[Dict[str, Any]] = [  # 最终输出：先给模型一条完成回执，再返回 html chunk
             {
                 "output_type": "text",
@@ -4448,8 +4967,12 @@ Parameters: {{"todos": [{{...}}]}}
 15. **terminate**: Finish the task. Parameters: {{"result": "final answer"}}
 16. **get_table_schema**: Return the full structure (columns/types/descriptions) of a specified table. Use it before writing SQL if you are unsure about column names.
 Parameters: {{"table_name": "table name"}}
-17. **get_glossary_term**: Query the business glossary for a term's detailed definition (ErrorCode / test item / indicator semantics). Use it when you need to understand errorcode meaning, test item definition, or indicator sourcing.
+17. **get_glossary_term**: Query the business glossary for a term's detailed definition (ErrorCode / test item / indicator semantics). Use it when you need to understand errorcode meaning, test item definition, or indicator sourcing. Passing a parent term (e.g. "不良代码（ErrorCode）") returns its full sub-term dictionary (all errorcodes).
 Parameters: {{"term_name": "term name"}}
+18. **get_lineage**: Query a table's upstream/downstream lineage and field mappings (parsed live from DolphinScheduler ETL SQL). Use it when you need to know which tables build a given table, which tables consume it, or how a column is computed.
+Parameters: {{"table_name": "table name, e.g. st_embed.dws_indicator_d"}}
+19. **get_table_info**: Return a table's full info in one call: business description (OpenMetadata) + schema (columns/types) + DolphinScheduler lineage & calculation logic (column←expression, upstream/downstream tables, build workflows). Use it when you need to deeply understand a table's purpose, how its indicator fields are computed, or which tables build it — instead of calling get_table_schema/get_lineage separately.
+Parameters: {{"table_name": "table name, e.g. st_embed.dws_indicator_w"}}
 
 {file_context}
 {knowledge_context}
@@ -4490,6 +5013,8 @@ Action Input: {{"result": "final answer text"}}
                 sql_query,
                 get_table_schema,   # 按需取表结构（OpenMetadata/Kyuubi）
                 get_glossary_term,  # 按需查术语库（errorcode/测项/指标含义）
+                get_lineage,        # 按需查表上下游血缘（DolphinScheduler ETL SQL 实时解析）
+                get_table_info,     # 按需取表完整信息：描述+结构+血缘/计算逻辑+上下游
                 todowrite,
                 Terminate(),
             ]
@@ -4592,7 +5117,8 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
     )
 
     agent_builder = (  # 用 Builder 模式组装 ReActAgent
-        ReActAgent(max_retry_count=30)  # 最大重试 30 次
+        # 最大 50 步（max_steps=max_retry_count），单轮运行超时 60 分钟（3600s）
+        ReActAgent(max_retry_count=50, max_timeout=3600)
         .bind(context)  # 绑定 AgentContext
         .bind(agent_memory)  # 绑定 AgentMemory
         .bind(llm_config)  # 绑定 LLMConfig
@@ -4612,7 +5138,8 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
     # {database_context} 中，完整表结构通过 get_table_schema 工具按需获取）
     # ─────────────────────────────────────────────────────────────
     received = AgentMessage(content=user_input)  # 构造 AgentMessage
-    stream_queue: asyncio.Queue = asyncio.Queue()  # 事件队列：agent 回调写、SSE 主循环读
+    stream_queue: asyncio.Queue = asyncio.Queue()  # 事件队列：agent 回调写、run_agent 处理读
+    sse_queue: asyncio.Queue = asyncio.Queue()  # 已处理 SSE 串队列：run_agent 写、SSE 生成器转发读
 
     # Wire up context-management status events into the SSE stream.
     # 把上下文管理状态事件转发到 SSE 流
@@ -4683,15 +5210,213 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
         logger.warning(f"Failed to load historical dialogues: {he}")
 
     async def run_agent():  # 启动 agent 的协程任务
-        return await agent.generate_reply(
-            received_message=received,  # 接收消息（user_input，无 schema 拼接）
-            sender=agent,  # 发送者 = agent 自身
-            stream_callback=stream_callback,  # 流式回调
-            # historical_dialogues 在 base_agent.py L1357-1371 被合并进 agent_messages
-            historical_dialogues=historical_dialogues or None,  # 历史对话（None 表示不传）
+        # 负责运行 agent、构建 history_steps 并持久化结果。
+        # 【架构】history_steps / live 步骤的构建由 run_agent 自己完成（消费 stream_queue，
+        # 调用 process_agent_event），生成器只转发已处理的 SSE 串。这样客户端断开（刷新）
+        # 取消生成器时，history_steps 仍持续累积——持久化不再只剩断开前的少数几步，
+        # /live 实时步骤也不冻结。
+        reply = None
+        err_msg = ""
+        agent_start_time = time.time()  # 本轮 agent 运行开始（用于持久化总耗时）
+        gen_task = asyncio.create_task(
+            agent.generate_reply(
+                received_message=received,  # 接收消息（user_input，无 schema 拼接）
+                sender=agent,  # 发送者 = agent 自身
+                stream_callback=stream_callback,  # 流式回调
+                # historical_dialogues 在 base_agent.py L1357-1371 被合并进 agent_messages
+                historical_dialogues=historical_dialogues or None,  # 历史对话（None 表示不传）
+            )
         )
+        try:
+            # 消费 stream_queue：每个事件走 process_agent_event（更新 history_steps /
+            # _todo_list / live updated_at），产出 SSE 串塞进 sse_queue 供生成器转发。
+            while True:
+                if gen_task.done() and stream_queue.empty():
+                    break
+                try:
+                    _ev = await asyncio.wait_for(stream_queue.get(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    continue
+                for _sse in process_agent_event(_ev):
+                    await sse_queue.put(_sse)
+            reply = await gen_task
+        except Exception as e:  # agent 执行异常
+            err_msg = f"React agent failed: {e}"
+            logger.warning(f"React agent failed: {e}")
+            if not gen_task.done():
+                gen_task.cancel()
+
+        # ---- 提取最终内容（逻辑与原生成器一致）----
+        if err_msg:
+            final_content = err_msg
+        elif reply.action_report and reply.action_report.terminate:  # 正常 terminate 结束
+            raw_content = reply.action_report.content or ""
+            # terminate 的 ActionOutput.content 是完整 LLM 原文，需从中提取 "result"
+            final_content = raw_content
+            try:
+                steps = parser.parse(raw_content)  # 解析 ReAct 步骤
+                if steps:
+                    action_input = steps[0].action_input  # 取 Action Input
+                    if action_input:
+                        # action_input 可能是字符串 '{"result": "..."}' 或 dict
+                        if isinstance(action_input, str):
+                            parsed_input = json.loads(action_input)
+                        else:
+                            parsed_input = action_input
+                        if isinstance(parsed_input, dict) and "result" in parsed_input:
+                            final_content = parsed_input["result"]  # 提取 result
+            except Exception:
+                pass
+            # 提取 result 失败时（final 仍为原始 ReAct 文本），做同样清理：
+            # 剥 ReAct 前缀 + 提取"最终答案"段，避免把思考草稿当最终答案。
+            if not final_content.strip() or re.match(
+                r"^(Thought|Action|Observation|Action Input)", final_content.strip(), re.I
+            ):
+                _cleaned = re.sub(
+                    r"^(Thought|Action|Action Input|Observation|Phase):\s*",
+                    "",
+                    final_content,
+                    flags=re.MULTILINE,
+                ).strip()
+                for _mk in ("**最终答案**", "最终答案：", "最终答案:", "**Final Answer**", "Final Answer:"):
+                    _i = _cleaned.rfind(_mk)
+                    if _i != -1:
+                        _cand = _cleaned[_i + len(_mk):]
+                        _cut = re.search(
+                            r"\n\s*(让我|我应该|不过|我需要确认|我认为|让我确认|让我尝试|考虑到|在\.\.\.)",
+                            _cand,
+                        )
+                        if _cut:
+                            _cand = _cand[:_cut.start()]
+                        _cand = _cand.strip()
+                        if len(_cand) >= 20:
+                            _cleaned = _cand
+                            break
+                if _cleaned:
+                    final_content = _cleaned
+        elif reply.action_report:  # 循环结束但未 terminate（达到最大步数或超时）
+            # reply.content 是含 ReAct 前缀的原始 LLM 输出，提取干净摘要
+            raw = reply.content or reply.action_report.content or ""
+            final_content = raw
+            try:
+                steps = parser.parse(raw)
+                if steps:
+                    last_step = steps[-1]
+                    # 优先用 observation，其次 thought
+                    if last_step.observations:
+                        final_content = last_step.observations
+                    elif last_step.thoughts:
+                        final_content = last_step.thoughts
+            except Exception:
+                pass
+            # 兜底：用正则去掉 ReAct 前缀
+            final_content = re.sub(
+                r"^(Thought|Action|Action Input|Observation|Phase):\s*",
+                "",
+                final_content,
+                flags=re.MULTILINE,
+            ).strip()
+            # 提取"最终答案"段作为干净回复，避免把整段思考草稿当最终答案
+            _found_clean_final = False  # C2/C3：是否提取到真正的最终答案
+            for _mk in ("**最终答案**", "最终答案：", "最终答案:", "**Final Answer**", "Final Answer:"):
+                _i = final_content.rfind(_mk)
+                if _i != -1:
+                    _cand = final_content[_i + len(_mk):]
+                    # 截断到后续草稿标记
+                    _cut = re.search(
+                        r"\n\s*(让我|我应该|不过|我需要确认|我认为|让我确认|让我尝试|考虑到|在\.\.\.)",
+                        _cand,
+                    )
+                    if _cut:
+                        _cand = _cand[:_cut.start()]
+                    _cand = _cand.strip()
+                    if len(_cand) >= 20:
+                        final_content = _cand
+                        _found_clean_final = True
+                        break
+            if not _found_clean_final:
+                # ── C2/C3：未正常 terminate 结束（超时/最大步数）兜底 ──
+                # 此时 final_content 可能是最后一步的原始 ReAct 思考/动作文本（如
+                # "The HTML report has been written successfully. Now I need to render
+                # it using html_interpreter..."），不能当最终答案。
+                # 若最后一步是 html_interpreter 且成功（报告已渲染），把报告作为最终产物；
+                # 否则给出清晰的"已达限制"说明，避免把思考草稿当最终答案。
+                _last_hs = history_steps[-1] if history_steps else None
+                _is_html_done = bool(
+                    _last_hs
+                    and _last_hs.get("status") == "done"
+                    and _last_hs.get("action") == "html_interpreter"
+                )
+                if _is_html_done:
+                    _fp = ""
+                    _ai = _last_hs.get("action_input") or ""
+                    try:
+                        _p = json.loads(_ai) if isinstance(_ai, str) else _ai
+                        if isinstance(_p, dict):
+                            _fp = _p.get("file_path") or ""
+                    except Exception:
+                        _fp = ""
+                    _fp_note = f"（{_fp}）" if _fp else ""
+                    final_content = (
+                        f"分析完成：已生成 HTML 报告并通过 html_interpreter 渲染展示{_fp_note}。"
+                        "请查看上方 html_interpreter 步骤的渲染结果。"
+                    )
+                else:
+                    final_content = (
+                        f"任务在执行 {len(history_steps)} 步后达到时间/步数限制，未产出最终答案。"
+                        "已完成的分析步骤见上方，可点击各步骤查看执行结果。"
+                    )
+        else:  # 没有 action_report
+            final_content = reply.content or ""
+
+        # ---- 清理残留的"思考中"占位 ----
+        # 正常情况下占位会被 act 替换为真实步骤，或 terminate 移除。若某轮 act
+        # 未到达/round 不匹配，占位会残留为 running 状态，最终 view 里就会出现
+        # 卡在"正在思考中"的死卡片（如 7860940b 的 step-20）。持久化前统一清掉。
+        _prev_len = len(history_steps)
+        history_steps[:] = [
+            hs
+            for hs in history_steps
+            if not (
+                hs.get("status") == "running"
+                and (hs.get("title") == "思考中" or hs.get("title") == "正在思考中")
+            )
+        ]
+        if len(history_steps) != _prev_len:
+            logger.info(
+                f"run_agent: cleaned {_prev_len - len(history_steps)} leftover "
+                f"'thinking' placeholder steps before persist"
+            )
+
+        # ---- 持久化 view 消息 ----
+        history_payload = json.dumps(
+            {
+                "version": 1,
+                "type": "react-agent",
+                "final_content": final_content,
+                "steps": history_steps,
+                "task_plan": list(_todo_list),
+                "generated_images": react_state.get("generated_images", []),
+                "elapsed_seconds": round(time.time() - agent_start_time, 1),  # 总耗时（前端完成后显示用）
+            },
+            ensure_ascii=False,
+        )
+        try:
+            storage_conv.add_view_message(history_payload)  # 写入 view 消息
+            storage_conv.end_current_round()  # 结束本轮
+            storage_conv.save_to_storage()  # 保存
+        except Exception as e:
+            logger.warning(f"run_agent persist failed: {e}")
+        finally:
+            _LIVE_AGENT_STEPS.pop(conv_id, None)  # 运行结束：移除实时状态，前端据此 reload
+
+        return reply, final_content
 
     agent_task = asyncio.create_task(run_agent())  # 创建后台任务执行 agent
+    # 保持任务引用，防止生成器（SSE 流）被客户端断开关闭后任务被 GC 取消，
+    # 确保 run_agent 的持久化（保存 view / 清 live）一定能执行。
+    _ACTIVE_AGENT_TASKS.add(agent_task)
+    agent_task.add_done_callback(_ACTIVE_AGENT_TASKS.discard)
     round_step_map: Dict[int, str] = {}  # ReAct 轮次 -> SSE step_id 的映射
     pending_thoughts: Dict[
         int, List[str]
@@ -4707,6 +5432,7 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
     _LIVE_AGENT_STEPS[conv_id] = {
         "steps": history_steps,
         "user_input": user_input,
+        "task_plan": _todo_list,  # 实时任务清单（todowrite 原地修改同一列表，live 接口能看到最新）
         "updated_at": time.time(),
     }
 
@@ -4718,6 +5444,17 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
                 break
         else:
             history_steps.append(step_dict)
+        # 诊断日志：记录每步创建/替换（排查 html_interpreter step 丢失问题）
+        logger.info(
+            f"[step] append/replace id={step_dict.get('id')} title={step_dict.get('title')} "
+            f"action={step_dict.get('action')} status={step_dict.get('status')} "
+            f"(history_steps now {len(history_steps)})"
+        )
+        # 同步刷新 live 的 updated_at，否则 agent 跑超过 15 分钟后 live 接口的
+        # "僵尸兜底"会误判 running=False，前端 reload 后看不到实时记录（滞后）。
+        live_entry = _LIVE_AGENT_STEPS.get(conv_id)
+        if live_entry is not None:
+            live_entry["updated_at"] = time.time()
 
     # Emit pre-loaded skill as an SSE step before agent starts processing
     # 如果预匹配了技能，在 agent 开始处理前先发一个 "Load Skill" SSE step
@@ -4763,19 +5500,25 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
         history_steps.append(current_history_step)  # 写入历史
         current_history_step = None
 
-    while True:  # SSE 主循环：从 stream_queue 取事件并转 SSE
-        if agent_task.done() and stream_queue.empty():  # agent 任务完成且队列空
-            break
-        try:
-            event = await asyncio.wait_for(stream_queue.get(), timeout=0.1)  # 100ms 取一个事件
-        except asyncio.TimeoutError:  # 超时继续下一轮
-            continue
+    def process_agent_event(event: Dict[str, Any]) -> List[str]:
+        """处理单个 agent 事件：更新 history_steps / todo 等会话状态，返回待发出的 SSE 串。
 
+        与 SSE 主循环共用同一套逻辑。run_agent 在客户端断开（生成器被取消、事件未被
+        消费）时也会调用它补全 history_steps，保证持久化/实时步骤完整——否则刷新页面
+        后生成器停止消费，history_steps 冻结在当时的步数（见 HANDOVER 问题 B 中间消息被吞）。
+        """
+        sse_out: List[str] = []  # 本事件产生的 SSE 串（生成器 yield；run_agent 丢弃）
+        current_history_step = None  # 本事件内临时 step 记录（函数内局部，不跨事件）
+        # 任何事件被处理都刷新 live 的 updated_at，防止长时间思考阶段（无 act 事件）
+        # 被 /live 的"僵尸兜底"（>15 分钟无更新判为 running=false）误判。
+        _live_entry = _LIVE_AGENT_STEPS.get(conv_id)
+        if _live_entry is not None:
+            _live_entry["updated_at"] = time.time()
         event_type = event.get("type")  # 取事件类型
         if event_type == "context.status":  # 上下文管理状态事件
             # Forward context-management status to frontend as-is.
             # 上下文管理状态事件直接转发给前端
-            yield _sse_event(event)
+            sse_out.append(_sse_event(event))
         elif event_type == "thinking":  # 完整 thinking 事件（一轮 LLM 回复）
             # Parse thinking content but don't create step yet
             # Step will be created when 'act' event arrives with confirmed
@@ -4823,13 +5566,29 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
             if chunk:
                 # Clean chunk: remove Action Input JSON to keep thought pure
                 # Split on Action Input pattern and keep only thought part
-                # 清洗 chunk：去掉 Action Input JSON，只保留 thought 部分
+                # 清洗 chunk：去掉 Action Input JSON，只保留 thought 部分。
+                # 模型输出常为 "**Action Input**: {...}"（带星号），正则需支持可选星号。
                 clean_chunk = re.split(
-                    r"\n\s*Action\s*Input\s*:\s*\{", chunk, maxsplit=1
+                    r"\n\s*(?:\*\*)?Action\s*Input(?:\*\*)?\s*:\s*\{", chunk, maxsplit=1
                 )[0]
                 # Also remove Action: lines
-                # 也去掉 Action: 行
-                clean_chunk = re.sub(r"\n\s*Action\s*:\s*\w+", "", clean_chunk)
+                # 也去掉 Action: 行（含 **Action**: 格式）
+                clean_chunk = re.sub(
+                    r"\n\s*(?:\*\*)?Action(?:\*\*)?\s*:\s*\w+", "", clean_chunk
+                )
+                # Remove Action Intention / Action Reason lines too (they are
+                # ReAct 结构行，不属于思考内容，避免显示在思考卡片里)
+                # 同时去掉 Action Intention / Action Reason 行
+                clean_chunk = re.sub(
+                    r"\n\s*(?:\*\*)?Action\s*Intention(?:\*\*)?\s*:[^\n]*",
+                    "",
+                    clean_chunk,
+                )
+                clean_chunk = re.sub(
+                    r"\n\s*(?:\*\*)?Action\s*Reason(?:\*\*)?\s*:[^\n]*",
+                    "",
+                    clean_chunk,
+                )
                 # Remove Thought: prefix if present
                 # 去掉 Thought: 前缀
                 if clean_chunk.startswith("Thought:"):
@@ -4844,7 +5603,7 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
                             "Thought/Action/Observation",
                         )
                         round_step_map[round_num] = pending_step_id
-                        yield pending_step_event  # 推 step.start
+                        sse_out.append(pending_step_event)  # 推 step.start
                         # 同步到 live steps：先显示一个 running 占位，act 完成时替换为真实 step
                         history_steps.append(
                             {
@@ -4856,14 +5615,32 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
                                 "action_reason": None,
                                 "action": None,
                                 "action_input": None,
+                                "thinking": "",  # 累积完整思考文本，供刷新后 live/history 恢复
                                 "outputs": [],
                                 "status": "running",
                             }
                         )
-                    # 注意：不要把思考文本 push 成 step.chunk —— 该 step 在 act 时会被
-                    # 重命名为 action 名（如 code_interpreter），text chunk 会被前端
-                    # 当成工具输出/代码渲染，污染输出框。思考文本只存 pending_thoughts，
-                    # 由 step.meta.thought 展示。
+                    # B1：把清洗后的思考增量实时推给前端（step.thought 事件），让"思考中"
+                    # 卡片实时显示思考内容。注意不要用 step.chunk —— 该 step 在 act 时会被
+                    # 重命名为 action 名（如 code_interpreter），text chunk 会被前端当成
+                    # 工具输出/代码渲染，污染输出框；step.thought 是独立事件，前端追加到
+                    # stepThoughts 显示在步骤卡片上方的 ThoughtBubble。占位 step 在 act 时
+                    # 被替换为真实 step（同 id），思考内容会挂在真实步骤卡片上。
+                    # 同时把思考文本持久化到 history step 的 thinking 字段，否则刷新页面后
+                    # （live/历史加载路径）思考内容会丢失。
+                    for _hs in history_steps:
+                        if _hs.get("id") == round_step_map[round_num]:
+                            _hs["thinking"] = (_hs.get("thinking") or "") + clean_chunk
+                            break
+                    sse_out.append(
+                        _sse_event(
+                            {
+                                "type": "step.thought",
+                                "id": round_step_map[round_num],
+                                "content": clean_chunk,
+                            }
+                        )
+                    )
 
         elif event_type == "act":  # act 事件：action 已执行完成
             # Create step ONLY when action is confirmed
@@ -4911,8 +5688,8 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
                     for t in _todo_list:
                         if t["status"] in ("pending", "in_progress"):
                             t["status"] = "completed"
-                    yield _sse_event({"type": "plan.update", "tasks": list(_todo_list)})  # 推 plan.update
-                continue
+                    sse_out.append(_sse_event({"type": "plan.update", "tasks": list(_todo_list)}))  # 推 plan.update
+                return sse_out
 
             # ── TodoWrite: emit plan.update SSE and show step card ──
             # ── TodoWrite：发 plan.update SSE 并展示 step 卡片 ──
@@ -4973,15 +5750,17 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
                 # 让 todowrite 卡片与其他 action 步骤按时间顺序内联展示
                 if round_num in round_step_map:  # 该轮已有 step
                     todo_step_id = round_step_map[round_num]
-                    yield _sse_event(  # 更新已有 step 的标题
-                        {
-                            "type": "step.start",
-                            "step": step,
-                            "id": todo_step_id,
-                            "title": _todo_step_title,
-                            "detail": "todowrite",
-                            "todo_meta": todo_meta,
-                        }
+                    sse_out.append(  # 更新已有 step 的标题
+                        _sse_event(
+                            {
+                                "type": "step.start",
+                                "step": step,
+                                "id": todo_step_id,
+                                "title": _todo_step_title,
+                                "detail": "todowrite",
+                                "todo_meta": todo_meta,
+                            }
+                        )
                     )
                 else:  # 该轮无 step，新建
                     todo_step_id, todo_step_event = build_step(
@@ -4989,25 +5768,29 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
                         "todowrite",
                     )
                     round_step_map[round_num] = todo_step_id
-                    yield _sse_event(
-                        {
-                            "type": "step.start",
-                            "step": step,
-                            "id": todo_step_id,
-                            "title": _todo_step_title,
-                            "detail": "todowrite",
-                            "todo_meta": todo_meta,
-                        }
+                    sse_out.append(
+                        _sse_event(
+                            {
+                                "type": "step.start",
+                                "step": step,
+                                "id": todo_step_id,
+                                "title": _todo_step_title,
+                                "detail": "todowrite",
+                                "todo_meta": todo_meta,
+                            }
+                        )
                     )
 
-                yield _sse_event({"type": "plan.update", "tasks": todos_payload})  # 推 plan.update
-                yield step_meta(  # 推 step.meta
-                    round_step_map[round_num],
-                    None,
-                    action,
-                    None,
-                    _todo_step_title,
-                    todo_meta=todo_meta,
+                sse_out.append(_sse_event({"type": "plan.update", "tasks": todos_payload}))  # 推 plan.update
+                sse_out.append(  # 推 step.meta
+                    step_meta(
+                        round_step_map[round_num],
+                        None,
+                        action,
+                        None,
+                        _todo_step_title,
+                        todo_meta=todo_meta,
+                    )
                 )
                 _append_or_replace_step(  # 记录到 history（若已存在"思考中"占位则替换）
                     {
@@ -5024,8 +5807,8 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
                         "todo_meta": todo_meta,
                     }
                 )
-                yield step_done(round_step_map[round_num])  # 推 step.done
-                continue
+                sse_out.append(step_done(round_step_map[round_num]))  # 推 step.done
+                return sse_out
 
             # Collect buffered thoughts for history persistence
             # (already streamed to frontend via thinking_chunk handler)
@@ -5070,14 +5853,14 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
                         "detail": "Thought/Action/Observation",
                     }
                 )
-                yield updated_event
+                sse_out.append(updated_event)
             else:  # 没有就新建
                 react_step_id, react_step_event = build_step(
                     action_title,
                     "Thought/Action/Observation",
                 )
                 round_step_map[round_num] = react_step_id
-                yield react_step_event
+                sse_out.append(react_step_event)
 
             # --- History: create step record ---
             # --- 历史：创建 step 记录 ---
@@ -5097,6 +5880,7 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
                 "action_reason": action_reason,
                 "action": action,
                 "action_input": action_input_str,
+                "thinking": thought_text or "",  # 完整思考文本（刷新后恢复用）
                 "outputs": [],
                 "status": "running",
             }
@@ -5108,7 +5892,7 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
             if action == "code_interpreter" and isinstance(action_input_data, dict):
                 code_payload = action_input_data.get("code")
             if isinstance(code_payload, str) and code_payload.strip():
-                yield step_chunk(react_step_id, "code", code_payload)  # 推 code chunk
+                sse_out.append(step_chunk(react_step_id, "code", code_payload))  # 推 code chunk
                 if current_history_step is not None:
                     current_history_step["outputs"].append(  # 记录到 history
                         {"output_type": "code", "content": code_payload}
@@ -5120,14 +5904,16 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
                 step_action_input = (  # code_interpreter 的 action_input 不再重复推（已作为 code chunk）
                     None if action == "code_interpreter" else action_input
                 )
-                yield step_meta(
-                    react_step_id,
-                    display_thought,
-                    action,
-                    step_action_input,
-                    action_title,
-                    action_intention=action_intention,
-                    action_reason=action_reason,
+                sse_out.append(
+                    step_meta(
+                        react_step_id,
+                        display_thought,
+                        action,
+                        step_action_input,
+                        action_title,
+                        action_intention=action_intention,
+                        action_reason=action_reason,
+                    )
                 )
 
             # Emit observation (action execution result)
@@ -5139,10 +5925,10 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
                 raw_chunks = emit_tool_chunks(react_step_id, observation_text)  # 解析 chunks
                 if raw_chunks:  # 有结构化 chunks
                     for chunk in raw_chunks:
-                        yield chunk
+                        sse_out.append(chunk)
                 else:  # 无结构化 chunks，按文本分片发出
                     for chunk in chunk_text(str(observation_text), max_len=600):
-                        yield step_chunk(react_step_id, "text", chunk)
+                        sse_out.append(step_chunk(react_step_id, "text", chunk))
                 # --- History: collect outputs from observation ---
                 # --- 历史：从 observation 收集 outputs ---
                 if current_history_step is not None:
@@ -5174,7 +5960,7 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
             # Mark step as done and track as last completed
             # 标记 step 完成（或失败）
             status = "done" if action_output.get("is_exe_success", True) else "failed"
-            yield step_done(react_step_id, status)  # 推 step.done
+            sse_out.append(step_done(react_step_id, status))  # 推 step.done
             if (  # 满足条件时自动推进 todo
                 status == "done"
                 and action
@@ -5185,7 +5971,7 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
             ):
                 updated_todos = advance_todo_list()
                 if updated_todos:
-                    yield _sse_event({"type": "plan.update", "tasks": updated_todos})  # 推 plan.update
+                    sse_out.append(_sse_event({"type": "plan.update", "tasks": updated_todos}))  # 推 plan.update
             # --- History: finalize step ---
             # --- 历史：终结 step ---
             if current_history_step is not None:
@@ -5193,142 +5979,28 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
                 _append_or_replace_step(current_history_step)  # 替换"思考中"占位或新增
                 current_history_step = None
 
+        return sse_out
+
+    while True:  # SSE 主循环：从 sse_queue 取已处理的 SSE 串并转发（history 由 run_agent 构建）
+        if agent_task.done() and sse_queue.empty():  # agent 任务完成且队列空
+            break
+        try:
+            sse_str = await asyncio.wait_for(sse_queue.get(), timeout=0.1)  # 100ms 取一个
+        except asyncio.TimeoutError:  # 超时继续下一轮
+            continue
+        yield sse_str
+
     try:
-        reply = await agent_task  # 等待 agent 任务完成
-    except Exception as e:  # agent 执行异常
-        err_msg = f"React agent failed: {e}"
-        error_payload = json.dumps(  # 错误 payload（结构化）
-            {
-                "version": 1,
-                "type": "react-agent",
-                "final_content": err_msg,
-                "steps": history_steps,
-                "task_plan": list(_todo_list),
-                "generated_images": react_state.get("generated_images", []),
-            },
-            ensure_ascii=False,
-        )
-        storage_conv.add_view_message(error_payload)  # 写入会话 view 消息
-        storage_conv.end_current_round()  # 结束本轮
-        storage_conv.save_to_storage()  # 保存
-        _LIVE_AGENT_STEPS.pop(conv_id, None)  # 运行结束：移除实时状态，前端据此 reload
-        yield _sse_event({"type": "final", "content": err_msg})  # 推 final
-        yield _sse_event({"type": "done"})  # 推 done
-        return
-
-    if reply.action_report and reply.action_report.terminate:  # 正常 terminate 结束
-        raw_content = reply.action_report.content or ""
-        # The terminate ActionOutput.content is the full raw LLM text, e.g.:
-        # "Thought: ...\nAction: terminate\nAction Input: {"result": "..."}"
-        # We need to extract the "result" value from Action Input.
-        # terminate 的 ActionOutput.content 是完整 LLM 原文，需要从中提取 "result"
-        final_content = raw_content
-        try:
-            steps = parser.parse(raw_content)  # 解析 ReAct 步骤
-            if steps:
-                action_input = steps[0].action_input  # 取 Action Input
-                if action_input:
-                    # action_input could be a string like '{"result": "..."}'
-                    # action_input 可能是字符串 '{"result": "..."}'
-                    if isinstance(action_input, str):
-                        parsed_input = json.loads(action_input)
-                    else:
-                        parsed_input = action_input
-                    if isinstance(parsed_input, dict) and "result" in parsed_input:
-                        final_content = parsed_input["result"]  # 提取 result
-        except Exception:
-            pass
-        # 提取 result 失败时（final 仍为原始 ReAct 文本，如 "Thought: ...答案..."），
-        # 做同样的清理：剥 ReAct 前缀 + 提取"最终答案"段，避免把思考草稿当最终答案。
-        if not final_content.strip() or re.match(
-            r"^(Thought|Action|Observation|Action Input)", final_content.strip(), re.I
-        ):
-            _cleaned = re.sub(
-                r"^(Thought|Action|Action Input|Observation|Phase):\s*",
-                "",
-                final_content,
-                flags=re.MULTILINE,
-            ).strip()
-            for _mk in ("**最终答案**", "最终答案：", "最终答案:", "**Final Answer**", "Final Answer:"):
-                _i = _cleaned.rfind(_mk)
-                if _i != -1:
-                    _cand = _cleaned[_i + len(_mk):]
-                    _cut = re.search(r"\n\s*(让我|我应该|不过|我需要确认|我认为|让我确认|让我尝试|考虑到|在\.\.\.)", _cand)
-                    if _cut:
-                        _cand = _cand[:_cut.start()]
-                    _cand = _cand.strip()
-                    if len(_cand) >= 20:
-                        _cleaned = _cand
-                        break
-            if _cleaned:
-                final_content = _cleaned
-    elif reply.action_report:  # 循环结束但未 terminate（达到最大步数或超时）
-        # Loop ended without terminate (max retries or timeout).
-        # reply.content is raw LLM output containing ReAct prefixes.
-        # Try to extract a clean summary from the last step's thought.
-        # 循环未 terminate 而结束；尝试从最后一步的 thought/observation 提取摘要
-        raw = reply.content or reply.action_report.content or ""
-        final_content = raw
-        try:
-            steps = parser.parse(raw)
-            if steps:
-                last_step = steps[-1]
-                # Prefer observation (execution result) > thought
-                # 优先用 observation，其次 thought
-                if last_step.observations:
-                    final_content = last_step.observations
-                elif last_step.thoughts:
-                    final_content = last_step.thoughts
-        except Exception:
-            pass
-        # Fallback: strip remaining ReAct prefixes via regex
-        # 兜底：用正则去掉 ReAct 前缀
-        final_content = re.sub(
-            r"^(Thought|Action|Action Input|Observation|Phase):\s*",
-            "",
-            final_content,
-            flags=re.MULTILINE,
-        ).strip()
-        # 模型常先草稿再给出"最终答案："段；循环结束时提取该段作为干净回复，
-        # 避免把整段思考草稿当最终答案展示。
-        for _mk in ("**最终答案**", "最终答案：", "最终答案:", "**Final Answer**", "Final Answer:"):
-            _i = final_content.rfind(_mk)
-            if _i != -1:
-                _cand = final_content[_i + len(_mk):]
-                # 截断到后续草稿标记（模型在最终答案后可能又开始"让我/我应该…"）
-                _cut = re.search(
-                    r"\n\s*(让我|我应该|不过|我需要确认|我认为|让我确认|让我尝试|考虑到|在\.\.\.)",
-                    _cand,
-                )
-                if _cut:
-                    _cand = _cand[:_cut.start()]
-                _cand = _cand.strip()
-                if len(_cand) >= 20:
-                    final_content = _cand
-                    break
-        if not final_content:  # 仍为空时给默认提示
-            final_content = "任务执行已达到最大步数限制，请查看上方各步骤的执行结果。"
-    else:  # 没有 action_report
-        final_content = reply.content or ""
-
-    # Persist AI reply with structured history payload
-    # 持久化 AI 回复（含结构化历史 payload）
-    history_payload = json.dumps(
-        {
-            "version": 1,
-            "type": "react-agent",
-            "final_content": final_content,
-            "steps": history_steps,
-            "task_plan": list(_todo_list),
-            "generated_images": react_state.get("generated_images", []),
-        },
-        ensure_ascii=False,
-    )
-    storage_conv.add_view_message(history_payload)  # 写入 view 消息
-    storage_conv.end_current_round()  # 结束本轮
-    storage_conv.save_to_storage()  # 保存
-    _LIVE_AGENT_STEPS.pop(conv_id, None)  # 运行结束：移除实时状态，前端据此 reload
-
+        # run_agent 内部已完成持久化（add_view + save + 清 live），这里只需拿到
+        # 最终内容用于 SSE final 事件；即使 SSE 客户端断开导致本生成器被取消，
+        # run_agent 后台任务也会把结果保存下来，F5 后能正常看到。
+        _, final_content = await agent_task  # 等待 agent 任务完成（含持久化）
+    except Exception as e:  # run_agent 意外失败（其内部已 catch 常规异常，这里兜底）
+        final_content = f"React agent failed: {e}"
+    except BaseException:
+        # 客户端中断（GeneratorExit/CancelledError）：run_agent 仍在后台保存，
+        # 这里不 yield、直接传播。
+        raise
     yield _sse_event({"type": "final", "content": final_content})  # 推 final
     yield _sse_event({"type": "done"})  # 推 done
 
@@ -5569,6 +6241,7 @@ async def dialogue_live_status(con_uid: str):
                 "running": True,
                 "steps": entry.get("steps", []),
                 "user_input": entry.get("user_input"),
+                "task_plan": entry.get("task_plan", []),
                 "updated_at": entry.get("updated_at"),
             }
         )

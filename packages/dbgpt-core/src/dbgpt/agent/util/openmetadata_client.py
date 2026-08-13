@@ -305,6 +305,7 @@ class OpenMetadataClient:
                 r2.raise_for_status()
                 terms = r2.json().get("data", [])
                 best_desc = ""
+                best_term = None
                 best_score = -1
                 # 错误码查询：去掉 "code"/"错误码" 前缀后的数字，用于描述匹配
                 code_num = ""
@@ -338,13 +339,49 @@ class OpenMetadataClient:
                     if score > best_score:
                         best_score = score
                         best_desc = d
+                        best_term = t
                 # 最低匹配阈值：至少 2 字 n-gram(20) / 描述含错误码(300) / 名字匹配(500+) 才算命中
-                if best_score >= 20:
-                    return " ".join(best_desc.split())
-                return ""
+                if best_score < 20:
+                    return ""
+                # 命中后：若该术语有子术语（如"不良代码（ErrorCode）"→10 大类），
+                # 递归收集所有后代，返回完整字典，让"列举全部"类问题也能用本工具回答。
+                if best_term is not None:
+                    children = self._collect_child_terms(best_term, terms)
+                    if children:
+                        lines = [" ".join(best_desc.split()), "", "【子术语】"]
+                        for c in children:
+                            cd = " ".join(c["desc"].split()) if c["desc"] else ""
+                            lines.append(f"- {c['name']}: {cd}")
+                        return "\n".join(lines)
+                return " ".join(best_desc.split())
         except Exception as e:
             logger.warning(f"OpenMetadata get_glossary_term failed: {e}")
             return ""
+
+    def _collect_child_terms(
+        self, parent_term: Dict, all_terms: List[Dict]
+    ) -> List[Dict[str, str]]:
+        """递归收集 parent_term 的所有后代子术语（按 parent.fullyQualifiedName 匹配）。
+
+        用于"列举全部"类查询：如 不良代码（ErrorCode）→ 10 大类子术语，
+        每类描述里含具体 errorcode。返回 [{name, desc}]（深度优先）。
+        """
+        parent_fqn = parent_term.get("fullyQualifiedName") or ""
+        result: List[Dict[str, str]] = []
+
+        def _walk(pfqn: str, depth: int) -> None:
+            for t in all_terms:
+                t_parent_fqn = (t.get("parent") or {}).get("fullyQualifiedName") or ""
+                if t_parent_fqn != pfqn:
+                    continue
+                name = t.get("name") or ""
+                if not name:
+                    continue
+                result.append({"name": name, "desc": t.get("description") or ""})
+                _walk(t.get("fullyQualifiedName") or "", depth + 1)
+
+        _walk(parent_fqn, 0)
+        return result
 
     async def get_table_schema(self, table_name: str) -> str:
         """返回指定表完整结构文本；失败/未启用返回空串。
@@ -369,8 +406,11 @@ class OpenMetadataClient:
                 # 默认用 get_entity_details（避免误匹配 search_metadata）
                 tool_name = "get_entity_details"
             if tool_name == "get_entity_details":
+                # table_name 可能已是全名（st_embed.dws_indicator_d），
+                # 取末段拼 fqn，避免 schema 前缀重复（st_embed.st_embed.xxx）。
+                bare = table_name.rsplit(".", 1)[-1]
                 fqn = self.config.table_schema_fqn_template.format(
-                    schema=self.config.schema or "", table=table_name
+                    schema=self.config.schema or "", table=bare
                 )
                 arguments = {"entityType": "table", "fqn": fqn}
             else:
@@ -418,16 +458,29 @@ class OpenMetadataClient:
                     f"{base}/api/v1/tables",
                     params={
                         "databaseSchema": sfqn,
-                        "name": table_name,
+                        "limit": 200,
                         "fields": "columns",
-                        "limit": 20,
                     },
                     headers=headers,
                 )
                 r2.raise_for_status()
+                # 注意：OpenMetadata 的 /api/v1/tables 不支持 name 过滤参数
+                # （name=<table> 会被忽略），所以必须拉全量再客户端匹配；
+                # 之前 limit=20 只返回字母序前 20 张，靠后的表（如
+                # ods_mes_production_report）永远匹配不到。
+                # 匹配支持全名/裸名/真实 FQN：调用方可能传 "st_embed.dws_indicator_d"、
+                # "dws_indicator_d" 或完整 FQN，逐一比对 name/fullyQualifiedName。
                 target = None
+                q_bare = table_name.rsplit(".", 1)[-1]
                 for t in r2.json().get("data", []):
-                    if t.get("name") == table_name:
+                    t_name = t.get("name") or ""
+                    t_fqn = t.get("fullyQualifiedName") or ""
+                    if (
+                        t_name == table_name
+                        or t_fqn == table_name
+                        or t_name == q_bare
+                        or t_fqn.endswith("." + q_bare)
+                    ):
                         target = t
                         break
                 if not target:

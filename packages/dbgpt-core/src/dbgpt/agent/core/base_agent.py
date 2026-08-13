@@ -135,7 +135,7 @@ class ConversableAgent(Role, Agent):
     bind_prompt: Optional[PromptTemplate] = None  # 绑定的提示词模板（系统提示词来源之一）
     run_mode: Optional[AgentRunMode] = Field(default=None, description="Run mode")  # 运行模式（单次 / 循环）
     max_retry_count: int = 3  # 最大重试次数（ReAct 循环上限）
-    max_timeout: int = 600  # 最大超时时间（秒），超过则终止循环
+    max_timeout: int = 3600  # 最大超时时间（秒），超过则终止循环（曾 600s→1200s，复杂任务第一步思考就要 5 分钟；2026-08-12 提到 60 分钟）
     llm_client: Optional[AIWrapper] = None  # LLM 客户端包装器（在 build 中初始化）
     # 确认当前Agent是否需要进行流式输出
     stream_out: bool = True
@@ -1058,12 +1058,28 @@ class ConversableAgent(Role, Agent):
                                 "报告已生成", "报告生成", "让我渲染", "进行渲染",
                             )
                         )
+                        # 模型终止内容是纯问候/自我介绍/能力介绍（用户没要求分析）时，
+                        # 不视为"过早终止"：对"hi/你好"等简单提问，若强行要求先做数据
+                        # 分析会陷入"回答→被拒→再回答"的无限循环（会烧到 max_retry_count）。
+                        _is_greeting = any(
+                            k in _terminate_text
+                            for k in (
+                                "你好", "您好", "哈喽", "hello",
+                                "请问有什么可以帮你", "请问有什么可以帮助",
+                                "有什么可以帮您", "有什么可以帮你的", "为您服务",
+                                "我是", "本助手", "很高兴", "欢迎",
+                                "已连接", "已接入", "随时找我",
+                                "我可以帮您", "我可以帮你",
+                            )
+                        )
                         _rounds = current_retry_counter + 1
                         if (
                             not _is_clarify
+                            and not _is_greeting
+                            and _rounds <= 6  # 轮次越深越信任模型，超过 6 轮不再强拦
                             and (
                                 (not _executed_data_query and (_rounds <= 3 or _is_planning))
-                                or (_rounds <= 6 and (_is_err_retry or _is_planning))
+                                or (_is_err_retry or _is_planning)
                             )
                         ):
                             logger.warning(

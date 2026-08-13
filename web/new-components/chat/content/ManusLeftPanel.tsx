@@ -488,46 +488,128 @@ const getTodoStepBadge = (t: (key: string, options?: Record<string, any>) => str
   return todoMeta.state === 'init' ? t('task_plan_new_badge') : '';
 };
 
+// 清洗思考文本：去掉 ReAct 结构行（Action / Action Intention / Action Reason /
+// Action Input），只留纯思考内容。兼容 **Action**: 带星号格式。
+const cleanThoughtText = (text: string): string =>
+  text
+    .replace(/(?:\*\*)?Action(?:\*\*)?\s*:\s*\w+/g, '')
+    .replace(/(?:\*\*)?Action\s*Intention(?:\*\*)?\s*:[^\n]*/g, '')
+    .replace(/(?:\*\*)?Action\s*Reason(?:\*\*)?\s*:[^\n]*/g, '')
+    .replace(/(?:\*\*)?Action\s*Input(?:\*\*)?\s*:\s*\{[^}]*\}/g, '')
+    .split('\n')
+    .map(l => l.trim())
+    .filter(Boolean)
+    .join('\n');
+
+// header "DB-GPT 正在思考"状态栏展示的思考摘要：同时显示 thought（思考文本摘要）和 action（下一步动作）。
+// 从思考草稿里提取最近的 Action（如 "**Action**: sql_query"），并取思考文本去噪后的摘要。
+const summarizeThoughtText = (text: string): string => {
+  if (!text) return '';
+  // 提取最近的 Action（Action: xxx / **Action**: xxx）
+  let act = '';
+  const actionMatches = text.match(/(?:\*\*)?Action(?:\*\*)?\s*:\s*([\w_]+)/g);
+  if (actionMatches && actionMatches.length) {
+    const last = actionMatches[actionMatches.length - 1];
+    const a = last.replace(/(?:\*\*)?Action(?:\*\*)?\s*:\s*/, '').trim();
+    if (a && !['terminate'].includes(a.toLowerCase())) act = a;
+  }
+  // 思考文本摘要：清洗结构行、合并空白、去相邻重复、截断
+  const lines = cleanThoughtText(text)
+    .split('\n')
+    .map(l => l.trim())
+    .filter(Boolean);
+  const deduped: string[] = [];
+  for (const line of lines) {
+    if (deduped[deduped.length - 1] !== line) deduped.push(line);
+  }
+  const joined = deduped.join(' ');
+  const thoughtSummary = joined.length > 60 ? `${joined.slice(0, 60)}…` : joined;
+  if (act && thoughtSummary) return `${thoughtSummary} · 下一步：${act}`;
+  if (act) return `下一步：${act}`;
+  return thoughtSummary || cleanThoughtText(text).slice(0, 60);
+};
+
 const StepCard: React.FC<{
   step: ExecutionStep;
   isActive: boolean;
   onClick: () => void;
-}> = memo(({ step, isActive, onClick }) => {
+  stepThoughts?: Record<string, string>;
+  totalSteps?: number;
+  currentIndex?: number;
+}> = memo(({ step, isActive, onClick, stepThoughts, totalSteps, currentIndex }) => {
   const { t } = useTranslation();
   const [isVisible, setIsVisible] = useState(false);
+  const [elapsedSec, setElapsedSec] = useState(0); // B2: 思考计时
   const detailLine = step.description ? step.description.split('\n')[0] : '';
   const isTodoStep = detailLine.toLowerCase() === 'todowrite' || step.title.startsWith('TODO::') || !!step.todoMeta;
-
-  React.useEffect(() => {
-    const timer = setTimeout(() => setIsVisible(true), 50);
-    return () => clearTimeout(timer);
-  }, []);
   const isThinkingStep =
     step.status === 'running' &&
     (step.title === t('thinking') ||
       step.title === '思考中' ||
       step.title === '正在思考中' ||
       step.title?.toLowerCase() === 'thinking');
+
+  // B2: 思考卡片挂载后每秒更新已思考时长；退出思考态（act 替换为真实步骤）时清零
+  useEffect(() => {
+    if (!isThinkingStep) {
+      setElapsedSec(0);
+      return;
+    }
+    const iv = setInterval(() => setElapsedSec(s => s + 1), 1000);
+    return () => clearInterval(iv);
+  }, [isThinkingStep]);
+
+  React.useEffect(() => {
+    const timer = setTimeout(() => setIsVisible(true), 50);
+    return () => clearTimeout(timer);
+  }, []);
+
   if (isThinkingStep) {
+    const tFn = t as (key: string, options?: Record<string, any>) => string;
+    const elapsedMin = Math.floor(elapsedSec / 60);
+    const elapsedSecStr = String(elapsedSec % 60).padStart(2, '0');
+    const thoughtText = (stepThoughts?.[step.id] || '').trim();
+    const progressText =
+      totalSteps && totalSteps > 0 ? tFn('thinking_progress', { current: currentIndex ?? 1, total: totalSteps }) : '';
+    const elapsedText = tFn('thinking_elapsed', { time: `${elapsedMin}:${elapsedSecStr}` });
     return (
       <div
         onClick={onClick}
         className={classNames(
-          'inline-flex items-center gap-2 px-3 py-1.5 rounded-full cursor-pointer transition-all duration-200',
-          'bg-gray-100 dark:bg-gray-800',
+          'group relative cursor-pointer rounded-lg border transition-all duration-200',
+          'bg-gradient-to-r from-blue-50/90 via-white to-white dark:from-[#1d2632] dark:via-[#1a1b1e] dark:to-[#1a1b1e]',
+          'border-blue-200/80 dark:border-blue-500/25',
+          'px-3 py-2.5',
           'transform',
           {
             'opacity-0 translate-y-1': !isVisible,
             'opacity-100 translate-y-0': isVisible,
+            'shadow-[0_8px_20px_rgba(59,130,246,0.10)] ring-1 ring-blue-200/60 dark:ring-blue-500/20': isActive,
+            'hover:border-blue-300/90 dark:hover:border-blue-500/40 hover:shadow-[0_6px_16px_rgba(59,130,246,0.08)]':
+              !isActive,
           },
         )}
         style={{ transition: 'opacity 0.2s ease-out, transform 0.2s ease-out' }}
       >
-        <span className='relative flex h-2.5 w-2.5'>
-          <span className='animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75' />
-          <span className='relative inline-flex rounded-full h-2.5 w-2.5 bg-gradient-to-r from-blue-400 to-cyan-400' />
-        </span>
-        <span className='text-sm text-gray-700 dark:text-gray-300'>{t('thinking')}</span>
+        <div className='absolute left-0 top-2 bottom-2 w-[3px] rounded-r-full bg-gradient-to-b from-blue-400 via-cyan-400 to-emerald-400 animate-pulse' />
+        {/* Header: spinner + 正在思考 + 进度 + 计时 */}
+        <div className='flex items-center gap-2 pl-1'>
+          <span className='relative flex h-3 w-3'>
+            <span className='animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75' />
+            <span className='relative inline-flex rounded-full h-3 w-3 bg-gradient-to-r from-blue-400 to-cyan-400' />
+          </span>
+          <span className='text-sm font-medium text-gray-800 dark:text-gray-200'>{t('thinking')}</span>
+          <span className='ml-auto flex items-center gap-2 text-xs text-gray-400 dark:text-gray-500'>
+            {progressText && <span>{progressText}</span>}
+            <span className='tabular-nums'>{elapsedText}</span>
+          </span>
+        </div>
+        {/* 实时思考内容（B1 推送的 step.thought 增量，经 StreamingText 流式显示；用 cleanThoughtText 去掉 Action 结构行） */}
+        {thoughtText && (
+          <div className='mt-2 max-h-24 overflow-y-auto whitespace-pre-wrap break-words rounded-md bg-white/70 dark:bg-white/5 px-2 py-1.5 text-xs leading-relaxed text-slate-600 dark:text-slate-400'>
+            <StreamingText text={cleanThoughtText(thoughtText)} />
+          </div>
+        )}
       </div>
     );
   }
@@ -776,17 +858,41 @@ const ThoughtBubble: React.FC<{ text: string | Record<string, unknown> }> = memo
       return String(text);
     }
   }, [text]);
+  const [expanded, setExpanded] = useState(false);
   const [intention, ...reasonLines] = normalized.split('\n');
   const reason = reasonLines.join('\n').trim();
+  // 思考文本过长时折叠：默认只留首行（意图），点击展开完整思考
+  const isLong = reason.length > 80;
 
   return (
     <div className='flex min-w-0 items-start gap-2 px-1 py-1'>
       <span className='mt-[5px] h-1.5 w-1.5 flex-shrink-0 rounded-full bg-slate-300 dark:bg-slate-600' />
       <div className='min-w-0 text-[12px] leading-relaxed text-slate-500 dark:text-slate-400'>
-        <p className='m-0 break-words'>
-          <StreamingText text={intention} />
-        </p>
-        {reason && <p className='m-0 mt-0.5 break-words text-slate-400 dark:text-slate-500'>{reason}</p>}
+        {isLong ? (
+          <div
+            className='group flex cursor-pointer items-start gap-1'
+            onClick={() => setExpanded(prev => !prev)}
+            title={expanded ? '收起思考' : '展开完整思考'}
+          >
+            <p className='m-0 min-w-0 flex-1 break-words'>
+              <StreamingText text={intention} />
+            </p>
+            <span className='mt-0.5 flex-shrink-0 text-slate-400 transition-colors group-hover:text-slate-600 dark:group-hover:text-slate-300'>
+              {expanded ? (
+                <CaretDownOutlined className='text-[10px]' />
+              ) : (
+                <CaretRightOutlined className='text-[10px]' />
+              )}
+            </span>
+          </div>
+        ) : (
+          <p className='m-0 break-words'>
+            <StreamingText text={intention} />
+          </p>
+        )}
+        {reason && (expanded || !isLong) && (
+          <p className='m-0 mt-0.5 break-words text-slate-400 dark:text-slate-500'>{reason}</p>
+        )}
       </div>
     </div>
   );
@@ -853,23 +959,38 @@ const SectionBlock: React.FC<{
       {/* Section Content */}
       {isExpanded && (
         <div className='ml-7 space-y-2 overflow-hidden'>
-          {stepThoughts?.['initial'] && <ThoughtBubble text={stepThoughts['initial']} />}
+          {stepThoughts?.['initial'] && <ThoughtBubble text={cleanThoughtText(stepThoughts['initial'])} />}
 
-          {section.steps.map(step => (
-            <React.Fragment key={step.id}>
-              {stepThoughts?.[step.id] && <ThoughtBubble text={stepThoughts[step.id]} />}
-              {step.description?.includes('Action: get_skill_resource') ? (
-                <SkillResourceCard
-                  step={step}
-                  isActive={step.id === activeStepId}
-                  onClick={() => onStepClick(step.id)}
-                />
-              ) : (
-                <StepCard step={step} isActive={step.id === activeStepId} onClick={() => onStepClick(step.id)} />
-              )}
-              {step.description?.includes('Observation:') && <ObservationFormatter observation={step.description} />}
-            </React.Fragment>
-          ))}
+          {section.steps.map((step, idx) => {
+            // 思考中卡片已内嵌实时思考内容，跳过外部 ThoughtBubble 避免重复显示
+            const isThinkingStep =
+              step.status === 'running' &&
+              (step.title === '思考中' || step.title === '正在思考中' || step.title?.toLowerCase() === 'thinking');
+            return (
+              <React.Fragment key={step.id}>
+                {!isThinkingStep && stepThoughts?.[step.id] && (
+                  <ThoughtBubble text={cleanThoughtText(stepThoughts[step.id])} />
+                )}
+                {step.description?.includes('Action: get_skill_resource') ? (
+                  <SkillResourceCard
+                    step={step}
+                    isActive={step.id === activeStepId}
+                    onClick={() => onStepClick(step.id)}
+                  />
+                ) : (
+                  <StepCard
+                    step={step}
+                    isActive={step.id === activeStepId}
+                    onClick={() => onStepClick(step.id)}
+                    stepThoughts={stepThoughts}
+                    totalSteps={section.steps.length}
+                    currentIndex={idx + 1}
+                  />
+                )}
+                {step.description?.includes('Observation:') && <ObservationFormatter observation={step.description} />}
+              </React.Fragment>
+            );
+          })}
         </div>
       )}
     </div>
@@ -912,6 +1033,22 @@ const ManusLeftPanel: React.FC<ManusLeftPanelProps> = ({
     },
     [onStepClick],
   );
+
+  // 当前思考内容：header "正在思考"摘要的数据源。
+  // 优先取 running 的"思考中"步骤的 stepThoughts；否则回退到最后有思考内容的步骤。
+  const currentThought = useMemo(() => {
+    for (const section of sections) {
+      for (const step of section.steps) {
+        if (step.status === 'running' && stepThoughts?.[step.id]) return stepThoughts[step.id];
+      }
+    }
+    for (const section of sections) {
+      for (const step of section.steps) {
+        if (stepThoughts?.[step.id]) return stepThoughts[step.id];
+      }
+    }
+    return stepThoughts?.[activeStepId || 'initial'] || '';
+  }, [sections, stepThoughts, activeStepId]);
 
   // Collapsed mode: show compact summary of the round
   if (isCollapsed) {
@@ -1058,9 +1195,7 @@ const ManusLeftPanel: React.FC<ManusLeftPanelProps> = ({
             ) : (
               <span className='text-sm'>{t('waiting_to_start')}</span>
             )}
-            {isWorking && stepThoughts?.[activeStepId || 'initial'] && (
-              <ThoughtBubble text={stepThoughts[activeStepId || 'initial']} />
-            )}
+            {isWorking && currentThought && <ThoughtBubble text={summarizeThoughtText(currentThought)} />}
           </div>
         )}
 
@@ -1070,9 +1205,7 @@ const ManusLeftPanel: React.FC<ManusLeftPanelProps> = ({
               <LoadingOutlined spin className='text-blue-500' />
               <span className='text-sm text-blue-600 dark:text-blue-400'>{t('db_gpt_thinking')}</span>
             </div>
-            {stepThoughts?.[activeStepId || 'initial'] && (
-              <ThoughtBubble text={stepThoughts[activeStepId || 'initial']} />
-            )}
+            {isWorking && currentThought && <ThoughtBubble text={summarizeThoughtText(currentThought)} />}
           </div>
         )}
 

@@ -8,7 +8,7 @@ engine-type session configuration.
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Type
+from typing import Any, Dict, List, Optional, Type
 
 from sqlalchemy import create_engine, text
 
@@ -537,6 +537,25 @@ class KyuubiConnector(HiveConnector):
         """Return the parameter class."""
         return KyuubiParameters
 
+    def run(self, command: str, fetch: str = "all") -> List:
+        """Execute SQL, retrying once after a stale-connection error.
+
+        Kyuubi/Trino closes idle Thrift connections; SQLAlchemy's pool keeps
+        the dead connection and every subsequent call fails with
+        "TSocket read 0 bytes" / "unexpected exception".  On failure we
+        dispose the pool (dropping dead connections) and retry once with a
+        fresh connection.
+        """
+        try:
+            return super().run(command, fetch)
+        except Exception as e:
+            logger.warning("Kyuubi run failed, disposing pool and retrying: %s", e)
+            try:
+                self._engine.dispose()
+            except Exception:
+                pass
+            return super().run(command, fetch)
+
     def get_table_comment(self, table_name: str) -> Dict:
         """Return table comment.
 
@@ -647,6 +666,13 @@ class KyuubiConnector(HiveConnector):
         """
         db_url = parameters.db_url()
         engine_args = parameters.engine_args() or {}
+        # Kyuubi/Trino 会关闭空闲 Thrift 连接；pool_recycle 定期回收连接，
+        # 避免复用已断开的死连接（否则报 "TSocket read 0 bytes" /
+        # "unexpected exception"）。配合 KyuubiConnector.run 的重试兜底。
+        engine_args.setdefault("pool_recycle", 300)
+        # pool_pre_ping: 取连接前先 ping 验证，静默丢弃 Kyuubi 已断开的死连接，
+        # 避免关闭回收时抛 ConnectionResetError / TTransportException 噪音。
+        engine_args.setdefault("pool_pre_ping", True)
         return cls(
             create_engine(db_url, **engine_args),
             engine_type=parameters.engine_type,

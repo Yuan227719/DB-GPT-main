@@ -448,7 +448,14 @@ class ReActOutputParser:
         to run tools should use only the first actionable step while preserving
         ``parse()`` for history and diagnostics.
         """
-        # 归一化 markdown 加粗标签：**Action:** → Action:，否则解析失败
+        # 归一化 markdown 加粗标签：**Action:** 或 **Action**: → Action:，否则解析失败。
+        # DeepSeek 常输出 **Action**:（闭合星号在冒号前）；旧正则只认冒号在星号内的
+        # **Action:** 格式，导致解析 0 steps、act() 守卫误判为"没有工具调用"而早退。
+        text = re.sub(
+            r"\*\*(Thought|Action|Action Input|Observation|Phase|Action Intention|Action Reason)\*\*\s*[:：]\s*",
+            r"\1: ",
+            text or "",
+        )
         text = re.sub(
             r"\*\*(Thought|Action|Action Input|Observation|Phase|Action Intention|Action Reason)\s*[:：]\s*\*\*",
             r"\1: ",

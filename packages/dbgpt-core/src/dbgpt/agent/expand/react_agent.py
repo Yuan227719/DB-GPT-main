@@ -266,57 +266,26 @@ class ReActAgent(ConversableAgent):
             steps = self.parser.parse_current_step(message_content)
             err_msg = None
             if not steps:
-                # 容错：模型把最终答案写成纯文本（无 Action:）且非 LLM 服务错误时，
-                # 视为 terminate 最终答案直接接受，而不是报"格式不正确"
+                # 模型输出无 Action: 的纯文本，无法确认是最终答案还是中途计划。
+                # 不盲目当最终答案接受（否则"现在查询 errorcode..."这类计划文字会被
+                # 误判为最终答案而早退）。统一要求 ReAct 格式：要么给出工具调用，
+                # 要么用 Action: terminate 结束。
                 if (
                     "Action:" not in message_content
                     and not _looks_like_llm_error(message_content)
                 ):
-                    # 但若模型只输出了"规划"（Action Intention/Reason）而漏掉 Action: 和
-                    # Action Input:，说明它在规划下一步但没给出实际工具调用 → 提示补全，
-                    # 而不是误当成 terminate 结束（否则"看了表结构就结束"）。
-                    if "Action Intention" in message_content or (
-                        "Action Reason" in message_content
-                    ):
-                        return ActionOutput(
-                            is_exe_success=False,
-                            content=(
-                                "你输出了 Action Intention / Action Reason 但没有给出实际的 "
-                                "工具调用。请补全：Action: <工具名> 和 "
-                                'Action Input: {<参数>}，然后继续执行；'
-                                "只有在真正完成后才用 Action: terminate 结束。"
-                            ),
-                        )
-                    # 模型"提到某工具名但没有真正调用"（如"现在使用 html_interpreter 渲染报告"
-                    # 却没输出 Action: html_interpreter）——说明它预告了下一步但漏了 Action 行。
-                    # 检测到已知工具名被提及且非最终答案时，提示补全，不误当 terminate。
-                    _mentioned = any(
-                        t in message_content
-                        for t in (
-                            "html_interpreter", "code_interpreter", "shell_interpreter",
-                            "sql_query", "get_table_schema", "get_glossary_term",
-                            "todowrite",
-                        )
-                    )
-                    if _mentioned and not any(
-                        k in message_content
-                        for k in ("任务完成", "已完成", "最终结果", "综上所述", "结果如下", "回答完毕", "结论")
-                    ):
-                        return ActionOutput(
-                            is_exe_success=False,
-                            content=(
-                                "你提到了要使用某个工具（如 html_interpreter / "
-                                "code_interpreter / sql_query）但没有给出实际的工具调用。"
-                                "请补全：Action: <工具名> 和 Action Input: {<参数>}，"
-                                "真正执行该工具；只有在真正完成后才用 Action: terminate 结束。"
-                            ),
-                        )
                     return ActionOutput(
-                        is_exe_success=True,
-                        content=message_content,
-                        thoughts=message_content,
-                        observations=message_content,
-                        terminate=True,
+                        is_exe_success=False,
+                        content=(
+                            "你的回复缺少 ReAct 格式的 Action 行，无法确认是最终答案还是计划。"
+                            "请严格按格式输出：\n"
+                            "Thought: <你的分析>\n"
+                            "Action: <工具名，或全部完成时用 terminate>\n"
+                            "Action Input: <工具参数 JSON，terminate 时为 "
+                            '{"result": "最终答案"}>。\n'
+                            "需要查询/生成/渲染时就调用对应工具；只有全部目标完成后才用 "
+                            "Action: terminate 结束。"
+                        ),
                     )
                 err_msg = (
                     "No correct response found. Please check your response, which must"
@@ -326,21 +295,21 @@ class ReActAgent(ConversableAgent):
                 err_msg = "Only one action is allowed each time."
             if err_msg:
                 return ActionOutput(is_exe_success=False, content=err_msg)
-            # 单个 step 但 action 为空、却有 intention/reason：模型只输出了"规划"
-            # 没给出实际工具调用（常见于"看了表结构就结束"）。提示补全，不误当 terminate。
+            # 单个 step 但 action 为空且非 terminate：模型解析出了 step 却没给出
+            # 实际的工具调用（如只有 Thought / Action Intention）。统一提示补全，
+            # 不误当 terminate。
             if (
                 steps
                 and len(steps) == 1
                 and not steps[0].action
                 and not steps[0].is_terminal
-                and (steps[0].action_intention or steps[0].action_reason)
             ):
                 return ActionOutput(
                     is_exe_success=False,
                     content=(
-                        "你输出了 Action Intention / Action Reason 但没有给出实际的 "
-                        "工具调用。请补全：Action: <工具名> 和 Action Input: {<参数>}，"
-                        "然后继续执行；只有在真正完成后才用 Action: terminate 结束。"
+                        "你的回复没有给出实际的工具调用（Action 为空）。请补全："
+                        "Action: <工具名> 和 Action Input: {<参数>}，然后继续执行；"
+                        "只有在真正完成后才用 Action: terminate 结束。"
                     ),
                 )
         except Exception as e:

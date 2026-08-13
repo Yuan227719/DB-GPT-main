@@ -42,6 +42,7 @@ import {
   FilePptOutlined,
   FileTextOutlined,
   LeftOutlined,
+  LockOutlined,
   PaperClipOutlined,
   PieChartOutlined,
   PlusOutlined,
@@ -72,7 +73,7 @@ import {
 import { NextPage } from 'next';
 import Image from 'next/image';
 import { useRouter } from 'next/router';
-import { useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 const generateUUID = () => {
@@ -87,8 +88,16 @@ const cleanFinalContent = (text: string): string => {
   let cleaned = text.replace(/\\n/g, '\n').trim();
   cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
   cleaned = cleaned.replace(/"\s*\}\s*$/, '').trim();
-  // Strip raw ReAct prefixes that may leak from the backend
-  cleaned = cleaned.replace(/^(Thought|Action|Action Input|Observation|Phase):\s*/gm, '').trim();
+  // Strip raw ReAct prefixes that may leak from the backend.
+  // 兼容 markdown 加粗 **Thought**: 与普通 Thought: 两种格式；
+  // 必须包含 Action Intention / Action Reason，否则模型原始 ReAct 文本会泄漏到输出。
+  cleaned = cleaned
+    .replace(
+      /^\s*\*\*(Thought|Action|Action Input|Action Intention|Action Reason|Observation|Phase)\*\*\s*[:：]\s*/gm,
+      '',
+    )
+    .replace(/^(Thought|Action|Action Input|Action Intention|Action Reason|Observation|Phase):\s*/gm, '')
+    .trim();
   return cleaned;
 };
 
@@ -143,6 +152,21 @@ interface DataSource {
   gmt_created?: string;
   gmt_modified?: string;
 }
+
+// 恒定连接：以下数据库/连接器必须始终保持选中，不能被 X 掉或取消选择。
+// 它们分别支撑 sql_query（st_embed 库）/ get_glossary_term（OpenMetadata 元数据）/
+// get_lineage（DolphinScheduler 血缘），误删会影响工具调用。
+const PINNED_DB_NAMES = ['st_embed'];
+const PINNED_CONNECTOR_KEYWORDS = ['openmetadata', 'dolphin', 'st_embed'];
+
+const isPinnedDb = (db?: Pick<DataSource, 'db_name'> | null): boolean =>
+  !!db && PINNED_DB_NAMES.includes((db.db_name || '').toLowerCase());
+
+const isPinnedConnector = (c?: ConnectorInstance | null): boolean => {
+  if (!c) return false;
+  const hay = `${c.connector_type || ''} ${c.display_name || ''}`.toLowerCase();
+  return PINNED_CONNECTOR_KEYWORDS.some(k => hay.includes(k));
+};
 
 // Define Knowledge Base Interface (Partial)
 interface KnowledgeSpace {
@@ -517,6 +541,32 @@ const Playground: NextPage = () => {
   // 当前对话是否正在运行中（由 live 轮询驱动，独立于本页发起的 SSE）。
   // 用于：切换/重载后回到一个仍在运行的对话时，发送按钮保持转圈禁用。
   const [convRunning, setConvRunning] = useState(false);
+  // 整个对话总计时：从发送问题（或 reload 进入运行中会话）开始，到本轮结束停止
+  const [convElapsedSec, setConvElapsedSec] = useState(0);
+  const convTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const convStartRef = useRef(0);
+
+  const stopConvTimer = useCallback(() => {
+    if (convTimerRef.current) {
+      clearInterval(convTimerRef.current);
+      convTimerRef.current = null;
+    }
+  }, []);
+  const startConvTimer = useCallback(() => {
+    stopConvTimer();
+    setConvElapsedSec(0);
+    convStartRef.current = Date.now();
+    convTimerRef.current = setInterval(() => {
+      setConvElapsedSec(Math.floor((Date.now() - convStartRef.current) / 1000));
+    }, 1000);
+  }, [stopConvTimer]);
+  const formatConvTime = (sec: number) => {
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    const ss = String(s).padStart(2, '0');
+    if (m >= 60) return `${Math.floor(m / 60)}:${String(m % 60).padStart(2, '0')}:${ss}`;
+    return `${m}:${ss}`;
+  };
 
   // Selection State
   const [isDbModalOpen, setIsDbModalOpen] = useState(false);
@@ -605,6 +655,12 @@ const Playground: NextPage = () => {
   const livePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   // refresh 后实时渲染：live view 消息的 id（一次创建，轮询只增量更新 executionMap）
   const liveViewIdRef = useRef<string | null>(null);
+  // 正在流式生成（SSE 进行中）的会话：防止发送第一条消息时 router.replace 触发
+  // [router.query.id] effect 重复 loadConversation 把刚创建的消息清空（竞态）。
+  const activeStreamConvRef = useRef<string | null>(null);
+  // UI 当前已渲染消息所属会话：loadConversation 拉历史为空时，若已渲染该会话消息
+  // （view 尚未落库的瞬时窗口），不要盲目 setMessages([]) 抹掉已显示内容。
+  const renderedConvRef = useRef<string | null>(null);
 
   const [historyLoading, setHistoryLoading] = useState(false);
   const [contextStatus, setContextStatus] = useState<{
@@ -731,38 +787,38 @@ const Playground: NextPage = () => {
   }, []);
 
   // 自动绑定默认数据源：新对话未选数据源时，默认选中 st_embed（避免每次手动选）
+  // 恒定连接：st_embed 数据库一旦可用就保持选中（不能被 X 掉 / 不能切换到其他库），
+  // 否则 sql_query 可能因无数据库而失败。找不到 st_embed 时才退化为默认第一个库。
   useEffect(() => {
-    if (!selectedDb && dataSources && dataSources.length > 0) {
-      const def = dataSources.find((ds: DataSource) => ds.db_name === 'st_embed') || dataSources[0];
+    if (!dataSources || dataSources.length === 0) return;
+    const pinned = dataSources.find((ds: DataSource) => isPinnedDb(ds));
+    if (pinned) {
+      if (!(selectedDb && isPinnedDb(selectedDb))) setSelectedDb(pinned);
+    } else if (!selectedDb) {
+      const def = dataSources[0];
       if (def) setSelectedDb(def);
     }
   }, [dataSources, selectedDb]);
 
-  // 自动选中 OpenMetadata connector（与数据源自动绑定同理）：否则每次都要手动
-  // 点连接 MCP，get_glossary_term 查术语库才会通。仅在首次加载、且用户尚未
-  // 主动操作连接器时生效，避免覆盖用户的增删选择。
-  const omAutoSelectedRef = useRef(false);
+  // 恒定连接：OpenMetadata / DolphinScheduler（含 st_embed 连接器）一旦可用就自动选中
+  // 并保持，不能被 X 掉或取消选择——它们支撑 get_glossary_term / get_lineage 等工具调用。
   useEffect(() => {
-    if (omAutoSelectedRef.current) return;
     if (!connectorsList || connectorsList.length === 0) return;
-    const om = (connectorsList as ConnectorInstance[]).find(
-      c =>
-        c.status === 'active' &&
-        ((c.connector_type || '').toLowerCase().includes('openmetadata') ||
-          (c.display_name || '').toLowerCase().includes('openmetadata')),
-    );
-    if (om) {
-      setSelectedConnectors(prev => {
-        if (prev.some(s => s.id === om.id)) return prev;
-        return [...prev, om];
-      });
-    }
-    omAutoSelectedRef.current = true;
+    const pinned = (connectorsList as ConnectorInstance[]).filter(c => c.status === 'active' && isPinnedConnector(c));
+    if (pinned.length === 0) return;
+    setSelectedConnectors(prev => {
+      const ids = new Set(prev.map(s => s.id));
+      const toAdd = pinned.filter(p => !ids.has(p.id));
+      return toAdd.length ? [...prev, ...toAdd] : prev;
+    });
   }, [connectorsList]);
 
   useEffect(() => {
     const convId = router.query.id as string | undefined;
-    if (convId && convId !== conversationId) {
+    // 发送第一条消息时 router.replace 与 setConversationId 异步提交存在竞态：若
+    // query.id 先提交而 conversationId 尚未更新，这里会误判为"切换会话"。此时该
+    // 会话正在流式生成，跳过 loadConversation，避免拉空历史把刚创建的消息清空。
+    if (convId && convId !== conversationId && activeStreamConvRef.current !== convId) {
       loadConversation(convId);
     } else if (!convId && conversationId) {
       // URL 中 id 消失（如点击 new_task / 探索广场），清空当前会话状态
@@ -779,9 +835,13 @@ const Playground: NextPage = () => {
       setFilePreviewError(null);
       setArtifacts([]);
       setRightPanelTab('preview');
+      setPreviewArtifact(null);
+      setRightPanelView('execution');
       setStreamingSummary('');
       setSummaryComplete(false);
       setTaskPlan([]);
+      renderedConvRef.current = null; // 离开会话/清空后不再保留"已渲染消息"归属
+      activeStreamConvRef.current = null; // 离开会话时一并清除流式标记（防滞留）
     }
   }, [router.query.id]);
 
@@ -1469,7 +1529,7 @@ const Playground: NextPage = () => {
     const effectiveSkill = overrideSkill !== undefined ? overrideSkill : selectedSkill;
     const effectiveDb = overrideDb !== undefined ? overrideDb : selectedDb;
     if (!inputQuery.trim() && !effectiveFile) return;
-    if (loading) {
+    if (loading || convRunning) {
       // 上一轮仍在处理：给出提示而不是静默丢弃，避免"发消息没反应"的困惑
       message.warning('上一轮还在处理中，请稍候再发送');
       return;
@@ -1538,12 +1598,32 @@ const Playground: NextPage = () => {
 
     // Prepare conversation ID
     const currentConvId = conversationId || generateUUID();
+    // 标记该会话进入流式生成：直到 SSE 流结束前，router effect / loadConversation
+    // 都不会去拉历史覆盖已渲染消息（防发送瞬间竞态 + 防空历史清空）。
+    activeStreamConvRef.current = currentConvId;
     if (!conversationId) {
       setConversationId(currentConvId);
       // 让刷新后能按 id 恢复会话：否则 F5 后 URL 仍是 /，当前提问会"消失"。
       // conversationId 与 router.query.id 同步提交，query.id 变化时 effect 中
       // convId === conversationId，不会触发重复 loadConversation。
       router.replace(`/?id=${currentConvId}`, undefined, { shallow: true });
+    }
+
+    // 兜底：即使本地状态未感知到（如测试脚本/其它端发起的运行），也主动查一次
+    // live，确保后端在处理同一会话时禁止再发消息，避免同 conv_uid 并发流导致
+    // chat_history_message 的 (conv_uid, index) UNIQUE 冲突。
+    try {
+      const liveRes = await axios.get(
+        `${process.env.API_BASE_URL ?? ''}/api/v1/chat/dialogue/live?con_uid=${currentConvId}`,
+      );
+      const liveData = liveRes?.data?.data || liveRes?.data;
+      if (liveData?.running) {
+        setConvRunning(true);
+        message.warning('上一条任务还在处理中，请稍候再发送');
+        return;
+      }
+    } catch (_e) {
+      // live 查询失败不阻塞发送
     }
 
     // Calculate current order
@@ -1589,7 +1669,12 @@ const Playground: NextPage = () => {
       },
     ]);
 
+    // 本会话已有消息渲染在 UI 上：loadConversation 拉历史为空时以此判断是否该保留，
+    // 避免发送瞬间被 router 竞态触发的 loadConversation 清空。
+    renderedConvRef.current = currentConvId;
+
     setLoading(true);
+    startConvTimer(); // 总计时：从发送问题开始
     setQuery(''); // Clear input
     setStreamingSummary('');
     setActiveViewMsgId(responseId); // Auto-switch right panel to new round
@@ -2032,6 +2117,7 @@ const Playground: NextPage = () => {
           }
         } else if (payload.type === 'done') {
           setLoading(false);
+          stopConvTimer(); // 总计时停止，保留最终耗时
         }
       };
 
@@ -2044,9 +2130,18 @@ const Playground: NextPage = () => {
         buffer = parts.pop() || '';
         parts.forEach(processEvent);
       }
+      // SSE 流已完全结束：该会话不再处于流式生成，允许 router effect 等正常加载历史。
+      if (activeStreamConvRef.current === currentConvId) activeStreamConvRef.current = null;
       setLoading(false);
+      stopConvTimer(); // 流结束（兜底，正常 done 已停）
+      // 正常结束：清掉当前轮次 view 的 thinking 标志，否则后台已跑完、
+      // 前端还一直显示"思考中"（错误路径在 catch 里已清，正常路径漏了）。
+      setMessages(prev => prev.map(m => (m.id === responseId && m.role === 'view' ? { ...m, thinking: false } : m)));
     } catch (err: any) {
+      // 流异常结束：同样清除流式标记，避免后续加载被误拦。
+      if (activeStreamConvRef.current === currentConvId) activeStreamConvRef.current = null;
       setLoading(false);
+      stopConvTimer();
       message.error(err?.message || 'Failed to get response');
       setMessages(prev => {
         const newMessages = [...prev];
@@ -2140,19 +2235,25 @@ const Playground: NextPage = () => {
     setFilePreviewError(null);
     setArtifacts([]);
     setRightPanelTab('preview');
+    setPreviewArtifact(null);
+    setRightPanelView('execution');
     setStreamingSummary('');
     setSummaryComplete(false);
+    renderedConvRef.current = null; // 清空会话后，不再保留任何"已渲染消息"归属
     router.push('/', undefined, { shallow: true });
   };
 
   const restoreFromHistory = (
     historyMessages: Array<{ role: string; context: string; order?: number; model_name?: string }>,
+    convUid: string,
   ) => {
     setExecutionMap({});
     setActiveMessageId(null);
     setActiveViewMsgId(null);
     setSelectedStepId(null);
     setArtifacts([]);
+    setPreviewArtifact(null);
+    setRightPanelView('execution');
     setStreamingSummary('');
     setSummaryComplete(false);
 
@@ -2160,6 +2261,8 @@ const Playground: NextPage = () => {
     const newExecutionMap: typeof executionMap = {};
     const allArtifacts: Artifact[] = [];
     const restoredSkillNames: Record<string, string> = {};
+    let lastElapsedSec = 0; // 持久化的总耗时（完成后刷新仍能显示）
+    let lastTaskPlan: TaskItem[] | undefined; // 最后一轮的任务清单（同步给全局 taskPlan）
 
     historyMessages.forEach(msg => {
       if (msg.role === 'human') {
@@ -2210,11 +2313,13 @@ const Playground: NextPage = () => {
                 }
               }
             }
-            const historyThought = s.action_intention
-              ? s.action_reason
-                ? `${s.action_intention}\n${s.action_reason}`
-                : s.action_intention
-              : s.thought;
+            const historyThought =
+              s.thinking ||
+              (s.action_intention
+                ? s.action_reason
+                  ? `${s.action_intention}\n${s.action_reason}`
+                  : s.action_intention
+                : s.thought);
             if (historyThought) {
               if (typeof historyThought === 'string') {
                 stepThoughts[stepId] = historyThought;
@@ -2271,6 +2376,10 @@ const Playground: NextPage = () => {
             }
           }
 
+          if (typeof payload.elapsed_seconds === 'number') {
+            lastElapsedSec = payload.elapsed_seconds; // 总耗时（完成后显示用）
+          }
+
           newMessages.push({
             id: viewId,
             role: 'view',
@@ -2283,6 +2392,9 @@ const Playground: NextPage = () => {
                 ? payload.tasks
                 : undefined,
           });
+          if (Array.isArray(payload.task_plan)) {
+            lastTaskPlan = payload.task_plan; // 记录最后一轮任务清单
+          }
         } else {
           newMessages.push({
             id: viewId,
@@ -2298,6 +2410,8 @@ const Playground: NextPage = () => {
     setMessages(newMessages);
     setExecutionMap(newExecutionMap);
     setArtifacts(allArtifacts);
+    setConvElapsedSec(lastElapsedSec); // 恢复总耗时（完成后的对话仍显示）
+    if (lastTaskPlan) setTaskPlan(lastTaskPlan); // 恢复任务清单（输入框上方卡片）
     if (Object.keys(restoredSkillNames).length > 0) {
       setCreatedSkillNames(prev => ({ ...prev, ...restoredSkillNames }));
     }
@@ -2308,6 +2422,18 @@ const Playground: NextPage = () => {
       setStreamingSummary(lastView.context || '');
       setSummaryComplete(true);
     }
+
+    // 刷新后自动预览 HTML 报告（与 SSE final 事件行为一致），否则用户点进
+    // 已完成对话看不到渲染的 HTML 文档，只在右侧看到文本摘要。
+    const htmlArtifact = allArtifacts.find(a => a.type === 'html');
+    if (htmlArtifact) {
+      setPreviewArtifact(htmlArtifact as Artifact);
+      setRightPanelView('html-preview');
+      setRightPanelCollapsed(false);
+    }
+    // 该会话消息已成功渲染到 UI：此后 loadConversation 拉历史为空时据此保留，
+    // 避免把刚恢复的内容又清空。
+    renderedConvRef.current = convUid;
   };
 
   const stopLivePolling = () => {
@@ -2366,11 +2492,13 @@ const Playground: NextPage = () => {
             }
           }
         }
-        const thought = s.action_intention
-          ? s.action_reason
-            ? `${s.action_intention}\n${s.action_reason}`
-            : s.action_intention
-          : s.thought;
+        const thought =
+          s.thinking ||
+          (s.action_intention
+            ? s.action_reason
+              ? `${s.action_intention}\n${s.action_reason}`
+              : s.action_intention
+            : s.thought);
         if (thought && typeof thought === 'string') {
           stepThoughts[id] = thought;
         }
@@ -2402,7 +2530,7 @@ const Playground: NextPage = () => {
   };
 
   // 检查某会话是否运行中：若是则显示实时进度并轮询，请求结束后重新加载最终历史
-  const checkLive = async (convUid: string) => {
+  const checkLive = async (convUid: string, trailingHuman = false) => {
     stopLivePolling();
     liveViewIdRef.current = null;
     try {
@@ -2410,11 +2538,18 @@ const Playground: NextPage = () => {
       const data = res?.data?.data || res?.data;
       if (data?.running) {
         setConvRunning(true);
+        startConvTimer(); // reload 进运行中会话：启动总计时
         const viewId = generateUUID();
         liveViewIdRef.current = viewId;
         // 只建一次消息：human（原问题）+ view（空上下文，steps 由轮询填充）
         setMessages(prev => {
-          if (prev.some(m => m.role === 'view')) return prev; // 已有 view（异常情况）不重复建
+          // 只在"最后一条已是 live 占位 view（空 context）"时跳过，避免重复；
+          // 否则即使历史已有旧 view（已完成轮次），也要为当前运行轮次补建 live view，
+          // 否则实时步骤渲染到不存在的消息 id 上，点进运行中会话看不到"思考中"状态框。
+          const lastMsg = prev[prev.length - 1];
+          if (lastMsg?.role === 'view' && lastMsg.context === '' && lastMsg.thinking) {
+            return prev;
+          }
           const hasHuman = prev.some(m => m.role === 'human');
           const humanMsg = hasHuman
             ? []
@@ -2434,10 +2569,16 @@ const Playground: NextPage = () => {
               role: 'view' as const,
               context: '',
               order: prev.length + humanMsg.length,
-              thinking: false,
+              thinking: true,
+              taskPlan: Array.isArray(data.task_plan) ? data.task_plan : undefined,
             },
           ];
         });
+        // 恢复运行中会话的任务清单（live 接口带 task_plan），否则刷新后任务清单丢失。
+        if (Array.isArray(data.task_plan)) setTaskPlan(data.task_plan);
+        // live view 已渲染，标记该会话有内容：后续 loadConversation 拉历史不完整时
+        // 据此保留现有 live 内容，避免重载把已显示的步骤抹掉。
+        renderedConvRef.current = convUid;
         setActiveViewMsgId(viewId);
         setRightPanelCollapsed(false);
         renderLiveSteps(viewId, data.steps || []);
@@ -2450,16 +2591,62 @@ const Playground: NextPage = () => {
               stopLivePolling();
               liveViewIdRef.current = null;
               setConvRunning(false);
+              stopConvTimer(); // 结束：停止总计时
+              // 运行已结束：先把 live 占位消息的 thinking 清掉、running 步骤置 done，
+              // 避免"正在思考"状态栏卡住（即使最终历史 reload 失败/为空也不残留）。
+              setMessages(prev => prev.map(m => (m.role === 'view' ? { ...m, thinking: false } : m)));
+              setExecutionMap(prev => {
+                const next: typeof prev = {};
+                for (const k of Object.keys(prev)) {
+                  const v = prev[k];
+                  next[k] = {
+                    ...v,
+                    steps: (v?.steps || []).map(s => (s.status === 'running' ? { ...s, status: 'done' as const } : s)),
+                  };
+                }
+                return next;
+              });
               loadConversation(convUid);
             } else if (liveViewIdRef.current) {
               renderLiveSteps(liveViewIdRef.current, d2.steps || []);
+              // 运行中任务清单可能变化，随轮询刷新（更新全局 + live view 消息）
+              if (Array.isArray(d2.task_plan)) {
+                setTaskPlan(d2.task_plan);
+                setMessages(prev =>
+                  prev.map(m =>
+                    m.id === liveViewIdRef.current && m.role === 'view' ? { ...m, taskPlan: d2.task_plan } : m,
+                  ),
+                );
+              }
             }
           } catch (_e) {
             /* 轮询失败忽略，下一轮再试 */
           }
-        }, 2500);
+        }, 1000); // 1s 轮询，让刷新后的思考内容更接近实时（原 2500ms）
       } else {
+        // 非运行中。若会话最新一轮只有 human（没有 view），可能是：① 后端刚收到请求、
+        // live 尚未注册（发送后立刻刷新，见后端"提前注册实时状态"）；② 中断未产出答案。
+        // 短暂重试 /live 数秒，等后端注册后进入 live 模式，避免思考胶囊等实时内容不显示。
+        if (trailingHuman) {
+          let entered = false;
+          for (let r = 0; r < 10; r++) {
+            await new Promise(res => setTimeout(res, 1000));
+            try {
+              const r3: any = await axios.get(`/api/v1/chat/dialogue/live?con_uid=${convUid}`);
+              const d3 = r3?.data?.data || r3?.data;
+              if (d3?.running) {
+                checkLive(convUid, true); // 重新进入 live 模式（含消息/步骤渲染守卫）
+                entered = true;
+                break;
+              }
+            } catch (_e) {
+              /* 忽略重试失败 */
+            }
+          }
+          if (entered) return;
+        }
         setConvRunning(false);
+        stopConvTimer(); // 非运行中：停止总计时
       }
     } catch (_e) {
       /* 接口失败忽略 */
@@ -2472,6 +2659,7 @@ const Playground: NextPage = () => {
     // 切换到该会话：即使历史为空也 setConversationId，确保 URL 变化时一定切换
     // （之前 `if (msgList.length > 0)` 会导致"中断/空历史的对话点不进去"）
     setConversationId(convUid);
+    let trailingHuman = false; // 最新一轮是否只有 human（无 view），供 checkLive 判断是否需要重试
     try {
       const res: any = await axios.get(`/api/v1/chat/dialogue/messages/history?con_uid=${convUid}`);
       // 若期间又点了别的对话（更新请求），丢弃本次过期响应
@@ -2487,29 +2675,42 @@ const Playground: NextPage = () => {
         msgList = res;
       }
       if (msgList && msgList.length > 0) {
-        restoreFromHistory(
-          msgList.map((m: any) => ({
-            role: m.role,
-            context: m.context,
-            order: m.order,
-            model_name: m.model_name,
-          })),
-        );
+        const mapped = msgList.map((m: any) => ({
+          role: m.role,
+          context: m.context,
+          order: m.order,
+          model_name: m.model_name,
+        }));
+        // 历史不完整：最新一轮只有 human、没有 view（view 尚未落库 / 本轮中断，
+        // 或 /live 僵尸兜底误报 running=false 时本轮还在跑）。此时若 UI 已渲染该会话
+        // 内容（live/SSE 进行中），用 [human] 整体替换会把已显示的 view+步骤抹掉，
+        // 造成"消息全部消失"。跳过本次重载，保留现有内容，等下次刷新/轮询补齐。
+        trailingHuman = mapped[mapped.length - 1]?.role === 'human';
+        if (trailingHuman && renderedConvRef.current === convUid) {
+          return;
+        }
+        restoreFromHistory(mapped, convUid);
       } else {
-        // 历史为空（如请求中断未落库）：清空当前消息，显示空会话
-        setMessages([]);
-        setExecutionMap({});
-        setActiveMessageId(null);
-        setActiveViewMsgId(null);
-        setArtifacts([]);
-        setTaskPlan([]);
+        // 历史为空。若当前 UI 已渲染该会话的消息（如发送瞬间的 router 竞态、
+        // 刷新进运行中会话但 view 尚未落库的瞬时窗口），不要盲目清空——
+        // 否则刚创建的 human+view / live 步骤会被抹掉，等 view 落库后由 reload/轮询补齐。
+        if (renderedConvRef.current !== convUid) {
+          setMessages([]);
+          setExecutionMap({});
+          setActiveMessageId(null);
+          setActiveViewMsgId(null);
+          setArtifacts([]);
+          setPreviewArtifact(null);
+          setRightPanelView('execution');
+          setTaskPlan([]);
+        }
       }
     } catch (e) {
       console.error('Failed to load conversation', e);
       message.error('加载历史对话失败');
     } finally {
       setHistoryLoading(false);
-      checkLive(convUid); // 检查是否运行中：是则显示实时进度并轮询
+      checkLive(convUid, trailingHuman); // 检查是否运行中：是则显示实时进度并轮询；trailingHuman 时重试
     }
   };
 
@@ -2643,7 +2844,15 @@ const Playground: NextPage = () => {
               <div
                 className={`${rightPanelCollapsed ? 'flex-1 max-w-[800px] border-r-0' : 'flex-[2] min-w-0 border-r border-gray-200/80 dark:border-gray-800'} flex flex-col overflow-hidden bg-white dark:bg-[#111217] transition-all duration-300 relative`}
               >
-                <div className='flex-1 min-h-0 overflow-y-auto'>
+                <div className='flex-1 min-h-0 overflow-y-auto scrollbar-default'>
+                  {/* 整个对话总计时：sticky 顶部，运行中递增，结束后保留最终耗时 */}
+                  {convElapsedSec > 0 && (
+                    <div className='sticky top-2 z-10 flex justify-center mb-2 pointer-events-none'>
+                      <div className='rounded-full bg-gray-100/90 dark:bg-[#232428]/90 backdrop-blur px-3 py-1 text-xs text-gray-500 dark:text-gray-400 tabular-nums shadow-sm'>
+                        {t('conv_total_time', { time: formatConvTime(convElapsedSec) })}
+                      </div>
+                    </div>
+                  )}
                   {rounds.map((round, roundIndex) => {
                     const isLastRound = roundIndex === rounds.length - 1;
                     const isSelected = round.viewMsg?.id === selectedViewMsgId;
@@ -2800,11 +3009,12 @@ const Playground: NextPage = () => {
                       <div className='flex flex-wrap gap-2 mb-2'>
                         {selectedDb && (
                           <Tag
-                            closable
+                            closable={!isPinnedDb(selectedDb)}
                             onClose={() => setSelectedDb(null)}
                             className='flex items-center gap-1 bg-blue-50 border-blue-200 text-blue-700 px-3 py-1 rounded-full'
                           >
                             {getDbIcon(selectedDb.type)} <span className='font-medium ml-1'>{selectedDb.db_name}</span>
+                            {isPinnedDb(selectedDb) && <LockOutlined className='text-[10px] ml-0.5 opacity-60' />}
                           </Tag>
                         )}
                         {selectedKnowledge && (
@@ -2821,11 +3031,12 @@ const Playground: NextPage = () => {
                             {selectedConnectors.map(c => (
                               <Tag
                                 key={c.id}
-                                closable
+                                closable={!isPinnedConnector(c)}
                                 onClose={() => setSelectedConnectors(prev => prev.filter(s => s.id !== c.id))}
                                 className='flex items-center gap-1 bg-violet-50 border-violet-200 text-violet-700 px-3 py-1 rounded-full'
                               >
                                 <ApiOutlined /> <span className='font-medium ml-1'>{c.display_name}</span>
+                                {isPinnedConnector(c) && <LockOutlined className='text-[10px] ml-0.5 opacity-60' />}
                               </Tag>
                             ))}
                           </>
@@ -3099,6 +3310,11 @@ const Playground: NextPage = () => {
                                           <div
                                             key={c.id}
                                             onClick={() => {
+                                              // 固定连接器不可取消选择（保持恒定连接，避免影响工具调用）
+                                              if (isPinnedConnector(c) && selectedConnectors.some(s => s.id === c.id)) {
+                                                setConnectorSearchQuery('');
+                                                return;
+                                              }
                                               setSelectedConnectors(prev =>
                                                 prev.some(s => s.id === c.id)
                                                   ? prev.filter(s => s.id !== c.id)
@@ -3429,12 +3645,13 @@ const Playground: NextPage = () => {
                           )}
                           {selectedDb && (
                             <Tag
-                              closable
+                              closable={!isPinnedDb(selectedDb)}
                               onClose={() => setSelectedDb(null)}
                               className='flex items-center gap-1 bg-blue-50 border-blue-200 text-blue-700 px-3 py-1 rounded-full'
                             >
                               {getDbIcon(selectedDb.type)}{' '}
                               <span className='font-medium ml-1'>{selectedDb.db_name}</span>
+                              {isPinnedDb(selectedDb) && <LockOutlined className='text-[10px] ml-0.5 opacity-60' />}
                             </Tag>
                           )}
                           {selectedKnowledge && (
@@ -3451,11 +3668,12 @@ const Playground: NextPage = () => {
                               {selectedConnectors.map(c => (
                                 <Tag
                                   key={c.id}
-                                  closable
+                                  closable={!isPinnedConnector(c)}
                                   onClose={() => setSelectedConnectors(prev => prev.filter(s => s.id !== c.id))}
                                   className='flex items-center gap-1 bg-violet-50 border-violet-200 text-violet-700 px-3 py-1 rounded-full'
                                 >
                                   <ApiOutlined /> <span className='font-medium ml-1'>{c.display_name}</span>
+                                  {isPinnedConnector(c) && <LockOutlined className='text-[10px] ml-0.5 opacity-60' />}
                                 </Tag>
                               ))}
                             </>
@@ -3712,6 +3930,11 @@ const Playground: NextPage = () => {
                                       <div
                                         key={c.id}
                                         onClick={() => {
+                                          // 固定连接器不可取消选择（保持恒定连接，避免影响工具调用）
+                                          if (isPinnedConnector(c) && selectedConnectors.some(s => s.id === c.id)) {
+                                            setConnectorSearchQuery('');
+                                            return;
+                                          }
                                           setSelectedConnectors(prev =>
                                             prev.some(s => s.id === c.id)
                                               ? prev.filter(s => s.id !== c.id)
@@ -3858,6 +4081,12 @@ const Playground: NextPage = () => {
                                       <div
                                         key={ds.id}
                                         onClick={() => {
+                                          // 固定数据库（st_embed）不可切换到其他库，保持恒定连接
+                                          if (isPinnedDb(selectedDb) && !isPinnedDb(ds)) {
+                                            setIsDbPanelOpen(false);
+                                            setDbSearchQuery('');
+                                            return;
+                                          }
                                           setSelectedDb(ds);
                                           setIsDbPanelOpen(false);
                                           setDbSearchQuery('');
@@ -4246,6 +4475,11 @@ const Playground: NextPage = () => {
               <List.Item
                 className={`cursor-pointer hover:bg-gray-50 rounded-lg px-2 transition-colors ${selectedDb?.id === item.id ? 'bg-blue-50' : ''}`}
                 onClick={() => {
+                  // 固定数据库（st_embed）不可切换到其他库，保持恒定连接
+                  if (isPinnedDb(selectedDb) && !isPinnedDb(item)) {
+                    setIsDbModalOpen(false);
+                    return;
+                  }
                   setSelectedDb(item);
                   setIsDbModalOpen(false);
                 }}
