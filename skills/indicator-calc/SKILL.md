@@ -1,5 +1,6 @@
 ---
 name: indicator-calc
+triggers: [良率, 完结良率, 坏块比率, 箱线图, 箱型图, 周报, 日报, 失效, DPPM, FBB, FBC, burnin]
 description: 计算与解释半导体测试指标体系（st_embed 商规EMBED 库）的指标口径与算法。当用户询问各类指标时触发，覆盖 良率/工单良率/完结良率、测试工单/测试样品、DPPM/失效DPPM、FBB比率/坏块比率、坏块/BB/bb/FBB/GBB、ECC分布/工单ECC/ECC坏块、ECC箱线图/箱型图/FBC/批次箱线/多cycle箱线、温度、电流、burnin/烧录/老化、日报/周报指标、趋势，以及表里没有的时间周期（如月）指标计算。触发关键词包括 良率/DPPM/FBB/坏块/ECC/温度/电流/burnin/烧录/老化/月/工单/趋势/BB/bb/fbb/gbb/工单良率/完结良率/测试工单/测试样品/ECC分布/工单ECC/箱线图/箱型图/FBC/批次/多cycle/日报/周报/指标/失效。
 ---
 

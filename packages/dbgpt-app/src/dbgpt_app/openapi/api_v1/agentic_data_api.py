@@ -150,13 +150,13 @@ _TABLE_ROUTING_HINTS: Dict[str, str] = {
     "ods_dut_result": "原始测试记录（日志级核对/回溯，已加工见 dwd_dut_result）",
     "ods_dut_result_item": "原始测项（日志级核对，已加工见 dwd_dut_result_item）",
     "ods_dut_result_subitem": "原始子项值（日志级核对，已加工见 dwd_dut_result_subitem）",
-    "dim_base_project": "项目配置：颗粒映射/PN/阈值（slc/tlc/qlc、DPPM、温度、电流）/BIBB",
+    "dim_base_project": "项目配置：颗粒映射/PN/阈值（slc/tlc/qlc、DPPM、温度、电流）/BIBB｜FL412E/YL512E 这类编号是项目号（非工单号）；工单号形如 SHCS26074748",
     "dim_base_sn_di": "串号查询：UID→SN、EFUSE ID、行转列维度字段（Port/FlashID/SerialNumber）",
-    "dim_base_wo_di": "工单信息：状态/分类/返测单、订单、委外厂商、数量、产品",
+    "dim_base_wo_di": "外挂订单维表（仅下单/返测单信息，不含当日测试数据）：订单状态/分类/委外厂商/数量；测试工单数据请查 dwd_dut_result_w/dws_indicator_w",
     "dim_dqc_db": "DB/zip 文件解析状态",
     "dim_dqc_state": "数据质量异常（WO_LOSS/DUPLICATE/NULL_FIELD）、处理状态/根因",
     "dwd_dqc_psn": "PSN 跨工单/PN 重复检测",
-    "dwd_dut_result": "DUT 测试明细首选（已补全 flash_pn/item_control，note 解析 test_number/machine_id/test_type）：站位/机台/测试类型",
+    "dwd_dut_result": "DUT 测试明细首选（已补全 flash_pn/item_control，note 解析 test_number/machine_id/test_type）：站位/机台/测试类型｜efuse_id=一颗样品（SN粒度），result_guid=一次测试记录（主键）｜周测试工单/样品数预计算指标在 dws_indicator_w（{flash_pn}_week_test）",
     "dwd_dut_result_item": "测项明细首选：RDT/ECC/功耗测项执行结果",
     "dwd_dut_result_subitem": "子项明细首选：子项值/规格上下限",
     "dwd_dut_result_w": "测项子项展开宽表：指标值（ECC/SleepCurrent/温度/VDT_COUNT）+维度值（软件包/Port）。注意 burnin_time 是各测项 time_elapse 的全量拷贝（非真烧录时长），真烧录时长在 dwd_fa_ecc_die_di",
@@ -192,7 +192,9 @@ _ROUTING_KEYWORDS: Dict[str, List[str]] = {
     "fbb异常": ["dws_indicator_d"],
     "指标": ["dws_indicator_d", "dws_indicator_w"],
     "良率": ["ods_mes_production_report", "dwd_mes_lot","dws_indicator_w"],
-    "工单": ["dim_base_wo_di", "dwd_dut_result_w", "dwd_dut_result"],
+    "工单": ["dwd_dut_result_w", "dwd_dut_result", "dws_indicator_w"],
+    "测试工单": ["dwd_dut_result"],
+    "测试样品": ["dwd_dut_result"],
     "errorcode": ["ods_mes_production_report", "dwd_dut_result", "dwd_mes_lot"],
     "错误码": ["ods_mes_production_report", "dwd_dut_result", "dwd_mes_lot"],
     "失效": ["ods_mes_production_report", "dwd_mes_lot", "dwd_dut_result"],
@@ -273,6 +275,18 @@ def route_tables(question: str, top_k: int = 8):
     glossary = any(kw in q for kw in _ROUTING_GLOSSARY_TERMS)
     knowledge = any(kw in q for kw in _ROUTING_KNOWLEDGE_TERMS)
     return tables, {"glossary": glossary, "knowledge": knowledge}
+
+def _is_write_tool(name: str) -> bool:
+    """数据 agent 只读原则：过滤 MCP 写工具 + 与本地工具重复的 get_entity_lineage。
+
+    注意：MCP 工具名带 connector 前缀（如 mcp__openmetadata__create_glossary），
+    需取最后一个 "__" 之后的短名再判定动词前缀。
+    """
+    short = name.rsplit("__", 1)[-1] if "__" in name else name
+    return (
+        short.startswith(("create_", "patch_", "delete_", "update_"))
+        or name == "mcp__openmetadata__get_entity_lineage"
+    )
 
 # 默认技能目录（来自全局配置）
 DEFAULT_SKILLS_DIR = SKILLS_DIR
@@ -736,6 +750,10 @@ async def _build_glossary_section(om_config: "OpenMetadataConfig") -> str:
             lines.append(f"- {name}: {desc}")
         # 内置补充术语：OM 术语库暂时没有的 Burnin 概念先硬编码在此，保证 prompt 可见；
         # 后续在 OpenMetadata 术语库补了同名术语后，可删除本行。
+        lines.append(
+            "- efuse_id/result_guid: efuse_id 唯一标识一颗样品（SN 粒度）；"
+            "result_guid 唯一标识一次测试记录（DUT 测试明细主键）。"
+        )
         lines.append(
             "- 烧录/Burnin（老化）: 可靠性老化测试，样品烧录时长单位秒。"
             "最准来源是 dwd_fa_ecc_die_di.burnin_time（eMMC 特有，由 VDT_INFO_CYCLE_/VDT_COUNT_VCC%"
@@ -2120,9 +2138,19 @@ async def _react_agent_stream(
     try:
         # 直接读内部字典，跳过 API 调用减少开销
         tool_resources = rm._type_to_resources.get("tool", [])
+        _EXCLUDED_DEFAULT_TOOLS = {
+            "baidu_search",
+            "list_dbgpt_support_models",
+            "get_current_host_cpu_status",
+            "get_current_host_memory_status",
+            "get_current_host_system_load",
+        }
         for reg_resource in tool_resources:
             if reg_resource.resource_instance is not None:
-                business_tools.append(reg_resource.resource_instance)
+                _inst = reg_resource.resource_instance
+                _name = getattr(_inst, "name", "") or ""
+                if _name not in _EXCLUDED_DEFAULT_TOOLS:
+                    business_tools.append(_inst)
     except Exception:
         # 没有业务工具也能继续，使用空列表
         pass  # If no business tools, continue with empty list
@@ -2228,10 +2256,10 @@ async def _react_agent_stream(
 {knowledge_section}
 ## 工具说明
 - 需要某表完整信息（业务描述/结构/血缘/计算逻辑）→ 用 'get_table_info(表名)' 一次拿全
-- 只查表结构（列名/类型）→ 'get_table_schema(表名)'；只查血缘/计算逻辑/上下游 → 'get_lineage(表名)'
+- 只查表结构（列名/类型）→ 'get_table_schema(表名)'
 - 理解 errorcode/测项/指标等业务术语含义 → 'get_glossary_term(术语名)'
 - 当前数据库 schema 是 st_embed（查业务字典表才是 embed_db / masterdata_db）
-- 若所选表查不到所需数据，用 'get_lineage(表名)' 追上下游换表再查，或 'get_table_schema(任意表)' 探索确认
+- 若所选表查不到所需数据，用 'get_table_info(表名)' 看上下游血缘换表再查，或 'get_table_schema(任意表)' 探索确认
 - **只允许 SELECT 查询，禁止 INSERT/UPDATE/DELETE/DROP/ALTER/TRUNCATE**
 - **SQL 必须用 Trino/Presto 语法**（底层是 Trino）：日期字面量用 `DATE '2026-07-27'`（不要用 `'2026-07-27'` 直接比 DATE 列）；字符串列转数值用 `CAST(x AS DOUBLE)`/`TRY_CAST`；百分比如 `'98.00%'` 用 `CAST(REPLACE(yield, '%', '') AS DOUBLE)` 转换；列名/别名若含保留字需加反引号
 """
@@ -2276,6 +2304,39 @@ async def _react_agent_stream(
             react_state["matched"] = pre_matched_skill
             react_state["skill_prompt"] = pre_matched_skill.get_prompt()
             logger.info(f"Pre-selected skill from ext_info: {skill_name}")
+
+    # ── Problem A：技能自动预匹配（trigger_keywords 版）──
+    # 触发词沉淀在各技能 SKILL.md frontmatter 的 triggers: 字段（claude_skill 解析器
+    # 填充 SkillMetadata.triggers），中文词子串匹配、纯 ASCII 词词边界匹配。
+    # 多技能命中时取触发词更长的（更具体）。护栏：上传文件跳过；ext_info 优先（上方分支）。
+    if not pre_matched_skill and not file_path:
+        _ui = (user_input or "").lower()
+        _best_meta = None
+        for _meta in registry.list_skills():
+            _triggers = getattr(_meta, "triggers", None)
+            if not _triggers:
+                continue
+            if not any(
+                (
+                    t.isascii()
+                    and re.search(
+                        r"(?<![a-z0-9])" + re.escape(t.lower()) + r"(?![a-z0-9])", _ui
+                    )
+                )
+                or (not t.isascii() and t.lower() in _ui)
+                for t in _triggers
+            ):
+                continue
+            if _best_meta is None or len(max(_triggers, key=len)) > len(
+                max(_best_meta.triggers, key=len)
+            ):
+                _best_meta = _meta
+        if _best_meta:
+            pre_matched_skill = registry.get_skill(_best_meta.name)
+            if pre_matched_skill:
+                react_state["matched"] = pre_matched_skill
+                react_state["skill_prompt"] = pre_matched_skill.get_prompt()
+                logger.info(f"Auto pre-matched skill from triggers: {_best_meta.name}")
 
     # 根据是否预选技能构造 skills_context：
     #   预选时只显示该技能，未预选时显示全部技能列表
@@ -3082,13 +3143,13 @@ print(json.dumps(summary, ensure_ascii=False))
         try:
             from dbgpt.agent.util.openmetadata_client import OpenMetadataClient
 
-            desc = await OpenMetadataClient(om_cfg).get_glossary_term(
+            result = await OpenMetadataClient(om_cfg).get_glossary_term(
                 _GLOSSARY_NAME, term_name
             )
-            if desc:
-                return json.dumps(
-                    {"term": term_name, "definition": desc}, ensure_ascii=False
-                )
+            if result:
+                # 客户端已返回 {"term": 实际匹配术语名, "definition": ...}，
+                # 直接透传，避免用查询名掩盖真实匹配名（2026-08-14 修复）
+                return result
         except Exception as e:
             logger.warning(f"get_glossary_term failed: {e}")
         return json.dumps(
@@ -4686,6 +4747,10 @@ print(json.dumps(summary, ensure_ascii=False))
             connector_tool_extras, _missing = _select_connector_tools(  # 选择 connector 对应的工具
                 connector_ids, _connector_manager
             )
+            connector_tool_extras = [
+                x for x in connector_tool_extras
+                if not _is_write_tool(getattr(x, "name", "") or "")
+            ]
             for _mid in _missing:  # 不活跃的 connector_id 警告
                 logger.warning(
                     "_react_agent_stream: connector_id %s not active, skipping",
@@ -4802,6 +4867,13 @@ The user sees progress in real time — never skip an update.
 Parameters: {{"todos": [{{...}}]}}
 8. **terminate**: Return the final answer when the task is completed. Action Input
 must be {{"result": "your final answer content"}}.
+9. **get_glossary_term**: Query the business glossary for a term's detailed
+definition (ErrorCode / test item / indicator semantics).
+   Parameters: {{"term_name": "term name"}}
+10. **get_table_info**: Return a table's full info in one call (business
+description + schema + lineage/calculation logic). Use it when unsure about a
+table's columns or origin.
+    Parameters: {{"table_name": "table name"}}
 
 ## Task Management
 For complex tasks that require 3 or more steps, use the `todowrite` tool to create
@@ -4838,7 +4910,7 @@ Action: The selected tool name (must be one of the tools listed above)
 Action Input: The JSON format of tool parameters
 """.strip()
 
-        tool_pack = ToolPack(  # 技能模式 ToolPack：只含技能相关工具
+        tool_pack = ToolPack(  # 技能模式 ToolPack：技能工具 + SKILL.md 规则要求的辅助工具
             [
                 execute_skill_script,
                 get_skill_resource,
@@ -4846,6 +4918,8 @@ Action Input: The JSON format of tool parameters
                 shell_interpreter,
                 html_interpreter,
                 sql_query,
+                get_glossary_term,  # SKILL.md 硬性规则：口径辅助（errorcode/测项/指标含义）
+                get_table_info,     # 列名不确定时取表完整信息
                 todowrite,
                 Terminate(),
             ]
@@ -4969,9 +5043,7 @@ Parameters: {{"todos": [{{...}}]}}
 Parameters: {{"table_name": "table name"}}
 17. **get_glossary_term**: Query the business glossary for a term's detailed definition (ErrorCode / test item / indicator semantics). Use it when you need to understand errorcode meaning, test item definition, or indicator sourcing. Passing a parent term (e.g. "不良代码（ErrorCode）") returns its full sub-term dictionary (all errorcodes).
 Parameters: {{"term_name": "term name"}}
-18. **get_lineage**: Query a table's upstream/downstream lineage and field mappings (parsed live from DolphinScheduler ETL SQL). Use it when you need to know which tables build a given table, which tables consume it, or how a column is computed.
-Parameters: {{"table_name": "table name, e.g. st_embed.dws_indicator_d"}}
-19. **get_table_info**: Return a table's full info in one call: business description (OpenMetadata) + schema (columns/types) + DolphinScheduler lineage & calculation logic (column←expression, upstream/downstream tables, build workflows). Use it when you need to deeply understand a table's purpose, how its indicator fields are computed, or which tables build it — instead of calling get_table_schema/get_lineage separately.
+18. **get_table_info**: Return a table's full info in one call: business description (OpenMetadata) + schema (columns/types) + DolphinScheduler lineage & calculation logic (column←expression, upstream/downstream tables, build workflows). Use it when you need to deeply understand a table's purpose, how its indicator fields are computed, or which tables build it — instead of calling get_table_schema separately.
 Parameters: {{"table_name": "table name, e.g. st_embed.dws_indicator_w"}}
 
 {file_context}
@@ -5002,6 +5074,9 @@ Action Input: {{"result": "final answer text"}}
         tool_pack = ToolPack(  # 完整模式 ToolPack：列出全部工具
             [
                 load_skill,
+                load_file,          # 上传文件信息（2026-08-14 按用户要求注册）
+                execute_analysis,   # 上传 Excel/CSV 快速分析（2026-08-14 按用户要求注册）
+                execute_tool,       # 通用工具分发（2026-08-14 按用户要求注册）
                 load_tools,
                 knowledge_retrieve,
                 execute_skill_script,
@@ -5013,7 +5088,6 @@ Action Input: {{"result": "final answer text"}}
                 sql_query,
                 get_table_schema,   # 按需取表结构（OpenMetadata/Kyuubi）
                 get_glossary_term,  # 按需查术语库（errorcode/测项/指标含义）
-                get_lineage,        # 按需查表上下游血缘（DolphinScheduler ETL SQL 实时解析）
                 get_table_info,     # 按需取表完整信息：描述+结构+血缘/计算逻辑+上下游
                 todowrite,
                 Terminate(),
@@ -5065,6 +5139,8 @@ Action Input: {{"result": "final answer text"}}
                     # 无需把所有参数 schema 提前塞给模型）。
                     for t in _c.get("tools", []):  # 遍历 connector 的工具
                         _name = t.get("name", "unknown")  # 工具名
+                        if _is_write_tool(_name):
+                            continue  # 写工具/重复血缘工具不进 prompt（与 ToolPack 过滤一致）
                         _desc = t.get("description", "") or "(no description)"  # 工具描述
                         _desc_line = (  # 描述超 100 字截断成一行
                             _desc[:100] + "..."
@@ -5412,11 +5488,6 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
 
         return reply, final_content
 
-    agent_task = asyncio.create_task(run_agent())  # 创建后台任务执行 agent
-    # 保持任务引用，防止生成器（SSE 流）被客户端断开关闭后任务被 GC 取消，
-    # 确保 run_agent 的持久化（保存 view / 清 live）一定能执行。
-    _ACTIVE_AGENT_TASKS.add(agent_task)
-    agent_task.add_done_callback(_ACTIVE_AGENT_TASKS.discard)
     round_step_map: Dict[int, str] = {}  # ReAct 轮次 -> SSE step_id 的映射
     pending_thoughts: Dict[
         int, List[str]
@@ -5980,6 +6051,15 @@ Pick the NEXT action that has NOT been done yet to make progress toward the fina
                 current_history_step = None
 
         return sse_out
+
+    agent_task = asyncio.create_task(run_agent())  # 创建后台任务执行 agent
+    # 保持任务引用，防止生成器（SSE 流）被客户端断开关闭后任务被 GC 取消，
+    # 确保 run_agent 的持久化（保存 view / 清 live）一定能执行。
+    # 注意：必须在 process_agent_event 及其闭包变量（round_step_map 等）定义之后
+    # 再调度 run_agent：技能模式的 Load Skill 事件即时到达，先调度会撞上
+    # "cannot access free variable process_agent_event" 竞态（2026-08-14 实测）。
+    _ACTIVE_AGENT_TASKS.add(agent_task)
+    agent_task.add_done_callback(_ACTIVE_AGENT_TASKS.discard)
 
     while True:  # SSE 主循环：从 sse_queue 取已处理的 SSE 串并转发（history 由 run_agent 构建）
         if agent_task.done() and sse_queue.empty():  # agent 任务完成且队列空

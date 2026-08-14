@@ -178,6 +178,7 @@ class FileBasedSkill:
             tags = to_list(parsed.get("tags"))
             required_tools = to_list(parsed.get("required_tools"))
             required_knowledge = to_list(parsed.get("required_knowledge"))
+            triggers_raw = to_list(parsed.get("triggers"))
             config = parsed.get("config") or {}
 
             metadata = SkillMetadata(
@@ -190,6 +191,7 @@ class FileBasedSkill:
                 tags=tags,
                 required_tools=required_tools,
                 required_knowledge=required_knowledge,
+                triggers={str(t) for t in triggers_raw if t},
                 config=config,
             )
             return metadata
@@ -232,6 +234,11 @@ class FileBasedSkill:
                 for t in metadata_dict.get("required_knowledge", "").split(",")
                 if t.strip()
             ]
+            triggers = {
+                t.strip()
+                for t in metadata_dict.get("triggers", "").split(",")
+                if t.strip()
+            }
 
             metadata = SkillMetadata(
                 name=name or "",
@@ -243,6 +250,7 @@ class FileBasedSkill:
                 tags=tags,
                 required_tools=required_tools,
                 required_knowledge=required_knowledge,
+                triggers=triggers,
             )
 
             return metadata
@@ -269,6 +277,19 @@ class FileBasedSkill:
             True if should activate this skill.
         """
         user_input_lower = user_input.lower()
+
+        # 优先 frontmatter triggers：中文子串匹配、纯 ASCII 词词边界匹配
+        # （DPPM/FBB/burnin 用词边界避免撞型号名；如 FBB12345 不命中）
+        for trig in self.metadata.triggers:
+            t = str(trig).lower()
+            if t.isascii():
+                if re.search(
+                    r"(?<![a-z0-9])" + re.escape(t) + r"(?![a-z0-9])", user_input_lower
+                ):
+                    return True
+            elif t in user_input_lower:
+                return True
+
         description_lower = self.metadata.description.lower()
 
         keywords = self._extract_keywords(description_lower)
